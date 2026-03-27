@@ -46,11 +46,11 @@ APP_VERSION = "v01.00.00"
 APP_TITLE = f"{APP_NAME} {APP_VERSION}"
 MIN_SPLASH_MS = 1200
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-BASE_DIR = r"C:/Sportifs"
+BASE_DIR = APP_DIR
 DATA_DIR = os.path.join(BASE_DIR, "Data")
-LOG_DIR = os.path.join(BASE_DIR, "Logs")
 # Local app runtime cache in current app folder
 CACHE_DIR = os.path.join(APP_DIR, ".appdata")
+LOG_DIR = os.path.join(CACHE_DIR, "logs")
 _single_instance_socket = None
 # Instagram login removed (web-only)
 DEFAULT_SPORT = "foot"
@@ -67,7 +67,8 @@ PLAYER_IG_HINTS = {
     # Manual trusted overrides (can be extended over time).
     "lucas chevalier": "@_lc30_",
 }
-IG_FAST_MODE = True  # Skip heavy Google/Selenium handle lookups for faster runs.
+# Fast mode by default. Set IG_FAST_MODE=0 to force complete mode at startup.
+IG_FAST_MODE_DEFAULT = str(os.getenv("IG_FAST_MODE", "1")).strip().lower() not in ("0", "false", "no")
 
 CSV_COLUMNS = [
     "Nom",
@@ -518,6 +519,64 @@ def wikipedia_extract_names_from_page(title: str, limit: int = 60, section_hints
     return names
 
 
+def wikipedia_resolve_wikidata_qid(name: str, club_hint: str = "") -> Optional[str]:
+    """
+    Resolve a player's Wikidata item through Wikipedia first.
+    This reduces homonym mismatches compared to pure Wikidata text search.
+    """
+    nm = (name or "").strip()
+    if not nm:
+        return None
+    q = f'"{nm}" footballer {club_hint}'.strip()
+    search_url = (
+        "https://en.wikipedia.org/w/api.php?"
+        f"action=query&list=search&srsearch={quote_plus(q)}&srlimit=5&format=json"
+    )
+
+    def _search():
+        r = http_get(search_url)
+        r.raise_for_status()
+        return r.json()
+
+    try:
+        data = RETRY.run(f"Wikipedia search {nm}", _search)
+        hits = (((data or {}).get("query") or {}).get("search") or [])
+        if not hits:
+            return None
+        nm_tokens = [t.lower() for t in re.findall(r"[A-Za-zÀ-ÿ]+", nm) if len(t) >= 3]
+        chosen_title = None
+        for h in hits:
+            title = (h.get("title") or "").strip()
+            low = title.lower()
+            if nm_tokens and all(t in low for t in nm_tokens[:2]):
+                chosen_title = title
+                break
+        if not chosen_title:
+            chosen_title = (hits[0].get("title") or "").strip()
+        if not chosen_title:
+            return None
+
+        pageprops_url = (
+            "https://en.wikipedia.org/w/api.php?"
+            f"action=query&prop=pageprops&ppprop=wikibase_item&titles={quote_plus(chosen_title)}&format=json"
+        )
+
+        def _props():
+            r = http_get(pageprops_url)
+            r.raise_for_status()
+            return r.json()
+
+        pdata = RETRY.run(f"Wikipedia pageprops {chosen_title}", _props)
+        pages = ((pdata or {}).get("query") or {}).get("pages") or {}
+        first_page = next(iter(pages.values())) if pages else {}
+        qid = ((first_page or {}).get("pageprops") or {}).get("wikibase_item")
+        if isinstance(qid, str) and qid.startswith("Q"):
+            return qid
+    except Exception:
+        return None
+    return None
+
+
 def wikidata_team_players(team_name: str, limit: int = 30, season_start_year: Optional[int] = None) -> List[dict]:
     """
     Best-effort roster-like list from Wikidata.
@@ -646,11 +705,16 @@ def normalize_instagram_handle(handle_or_url: Optional[str]) -> Optional[str]:
     if not handle_or_url:
         return None
     s = handle_or_url.strip()
-    if "instagram.com/" in s:
-        s = s.split("instagram.com/", 1)[1]
-    s = s.split("?", 1)[0].split("#", 1)[0].strip("/")
-    # Keep only profile URLs (single path segment). Reject /popular/x, /explore/..., etc.
-    if "/" in s:
+    lower = s.lower()
+    if "instagram.com/" in lower:
+        # Robust extraction even when URL includes tracking tokens (&sa=..., encoded fragments, etc.).
+        m = re.search(r"instagram\.com/([A-Za-z0-9._]+)/?", s, re.IGNORECASE)
+        if not m:
+            return None
+        s = m.group(1)
+    s = s.split("?", 1)[0].split("#", 1)[0].split("&", 1)[0].strip("/")
+    # Keep only profile handles (single path segment).
+    if "/" in s or " " in s:
         return None
     if not s:
         return None
@@ -885,7 +949,8 @@ class SearchFilters:
     min_followers: int
     age_min: Optional[int]
     age_max: Optional[int]
-    max_profiles: int = 20
+    # No practical cap by default.
+    max_profiles: int = 1_000_000
 
     @property
     def query(self) -> str:
@@ -914,6 +979,8 @@ class AthleteApp(tk.Tk):
         self._instagram_prompt_done = False
         self._instagram_public_ok: Optional[bool] = None
         self._instagram_public_message: str = "Instagram: initialisation…"
+        self._ig_fast_mode_var = tk.BooleanVar(value=IG_FAST_MODE_DEFAULT)
+        self._ig_fast_mode_current = bool(IG_FAST_MODE_DEFAULT)
         self._ig_scraper = None
         self._ig_handle_cache_path = os.path.join(CACHE_DIR, "instagram_handle_cache.json")
         self._ig_handle_cache: Dict[str, str] = {}
@@ -991,6 +1058,9 @@ class AthleteApp(tk.Tk):
         """
         try:
             self.after(0, lambda: self._set_status("Initialisation Instagram (mode public)…"))
+            append_log(
+                f"[IG] mode résolution handles: {'rapide (DDG)' if self._ig_fast_mode_var.get() else 'complet (Google+DDG+Selenium)'}"
+            )
             ok = False
             if self._ig_scraper is not None:
                 ok = bool(self._ig_scraper.probe())
@@ -1075,6 +1145,9 @@ class AthleteApp(tk.Tk):
         ttk.Label(form_row, text="Age max:").grid(row=0, column=12, sticky="e")
         self.age_max_var = tk.StringVar()
         ttk.Entry(form_row, textvariable=self.age_max_var, width=7).grid(row=0, column=13, padx=6)
+        ttk.Label(form_row, text="Max joueurs:").grid(row=0, column=14, sticky="e")
+        self.max_profiles_var = tk.StringVar(value="20")
+        ttk.Entry(form_row, textvariable=self.max_profiles_var, width=8).grid(row=0, column=15, padx=6)
 
         self.search_btn = ttk.Button(actions_row, text="🔍", width=3, command=self.on_search)
         self.search_btn.grid(row=0, column=0, padx=(0, 8), sticky="w")
@@ -1087,6 +1160,12 @@ class AthleteApp(tk.Tk):
 
         self.toggle_logs_btn = ttk.Button(actions_row, text="Afficher logs", command=self._toggle_logs)
         self.toggle_logs_btn.grid(row=0, column=6, padx=10, sticky="w")
+        self.ig_mode_check = ttk.Checkbutton(
+            actions_row,
+            text="Mode IG rapide",
+            variable=self._ig_fast_mode_var,
+        )
+        self.ig_mode_check.grid(row=0, column=7, padx=6, sticky="w")
 
         # Stabilize form layout so input fields remain visible.
         form_row.columnconfigure(1, weight=1, minsize=150)
@@ -1219,6 +1298,10 @@ class AthleteApp(tk.Tk):
             min_followers = int(self.min_followers_var.get().strip() or "0")
             age_min = int(self.age_min_var.get().strip()) if self.age_min_var.get().strip() else None
             age_max = int(self.age_max_var.get().strip()) if self.age_max_var.get().strip() else None
+            max_profiles_text = (self.max_profiles_var.get().strip() if getattr(self, "max_profiles_var", None) else "")
+            max_profiles = int(max_profiles_text) if max_profiles_text else 1_000_000
+            if max_profiles <= 0:
+                raise ValueError("max_profiles<=0")
         except ValueError:
             messagebox.showerror(APP_TITLE, "Filtres invalides. Utilisez des nombres.")
             return None
@@ -1231,12 +1314,23 @@ class AthleteApp(tk.Tk):
             min_followers=min_followers,
             age_min=age_min,
             age_max=age_max,
+            max_profiles=max_profiles,
         )
 
     def on_search(self) -> None:
         filters = self._get_filters()
         if not filters:
             return
+        # Freeze IG mode for the whole search run to avoid mid-run toggles/inconsistent logs.
+        self._ig_fast_mode_current = bool(self._ig_fast_mode_var.get())
+        append_log(
+            f"[IG] mode recherche courant: {'rapide (DDG)' if self._ig_fast_mode_current else 'complet (Google+DDG+Selenium)'}"
+        )
+        if self._ig_scraper is not None:
+            try:
+                self._ig_scraper.set_fast_mode(self._ig_fast_mode_current)
+            except Exception:
+                pass
         # New cancel token per search
         self._search_cancel_event = threading.Event()
         self._search_cancel_requested = False
@@ -1287,12 +1381,13 @@ class AthleteApp(tk.Tk):
                     ),
                 )
             else:
-                self.after(0, lambda: self._add_rows(rows))
                 self.after(0, lambda: self._set_status(f"{len(rows)} profils trouvés."))
                 self.after(0, lambda: self._autosave_csv(filters.query))
                 self.after(0, lambda: self._build_final_results_from_table())
         except SearchCancelled:
             self.after(0, lambda: self._set_status("Recherche annulée."))
+            self.after(0, lambda: self._autosave_csv(filters.query))
+            self.after(0, lambda: self._build_final_results_from_table())
         except Exception as exc:
             append_log(traceback.format_exc())
             self.after(0, lambda: messagebox.showerror(APP_TITLE, self._format_user_error(exc)))
@@ -1405,6 +1500,7 @@ class AthleteApp(tk.Tk):
                         continue
 
                     rows.append(row)
+                    self.after(0, lambda rr=dict(row): self._add_rows([rr]))
                     self.after(
                         0,
                         lambda a=idx, r=len(rows), n=name: self._update_search_dialog(
@@ -1418,6 +1514,7 @@ class AthleteApp(tk.Tk):
 
         rows: List[Dict[str, str]] = []
         analyzed = 0
+        ig_stats = {"handles": 0, "bio": 0, "followers": 0, "posts": 0}
         rejected = 0
         for p in players:
             self._raise_if_cancelled()
@@ -1458,6 +1555,7 @@ class AthleteApp(tk.Tk):
 
             # Followers/posts via web scraping is best-effort; keep empty if fails.
             rows.append(row)
+            self.after(0, lambda rr=dict(row): self._add_rows([rr]))
             self.after(
                 0,
                 lambda a=analyzed, r=len(rows), n=name: self._update_search_dialog(
@@ -1580,6 +1678,7 @@ class AthleteApp(tk.Tk):
 
         rows: List[Dict[str, str]] = []
         analyzed = 0
+        ig_stats = {"handles": 0, "bio": 0, "followers": 0, "posts": 0}
         try:
             self.after(
                 0,
@@ -1656,7 +1755,13 @@ class AthleteApp(tk.Tk):
                 row["Priorité"] = ""
 
                 # Step: Wikipedia -> Wikidata (always continue)
-                player_struct = self._build_player_struct(name=name, ig_username=username)
+                resolved_qid = wikipedia_resolve_wikidata_qid(name, club_hint=club)
+                player_struct = self._build_player_struct(
+                    name=name,
+                    ig_username=username,
+                    wikidata_qid=resolved_qid,
+                    club_hint=club,
+                )
                 # Apply structured fields back to CSV row
                 if player_struct.get("birth_date"):
                     row["Date de naissance"] = player_struct["birth_date"]
@@ -1671,6 +1776,14 @@ class AthleteApp(tk.Tk):
                     row["Nombre de posts"] = str(player_struct["posts"])
                 if player_struct.get("followers") is not None and not row.get("Nombre d'abonnés"):
                     row["Nombre d'abonnés"] = str(player_struct["followers"])
+                if player_struct.get("instagram"):
+                    ig_stats["handles"] += 1
+                if player_struct.get("bio"):
+                    ig_stats["bio"] += 1
+                if player_struct.get("followers") is not None:
+                    ig_stats["followers"] += 1
+                if player_struct.get("posts") is not None:
+                    ig_stats["posts"] += 1
 
                 # Instagram enrichment removed (web-only). Keep nullable.
 
@@ -1682,12 +1795,18 @@ class AthleteApp(tk.Tk):
                         continue
 
                 rows.append(row)
+                self.after(0, lambda rr=dict(row): self._add_rows([rr]))
                 self.after(
                     0,
                     lambda i=idx, a=analyzed, r=len(rows), n=name: self._update_search_dialog(
                         i, f"Profil retenu: {n}", analyzed=a, retained=r
                     ),
                 )
+            append_log(
+                "Résumé IG: "
+                f"handles={ig_stats['handles']}/{len(rows)} "
+                f"bio={ig_stats['bio']} followers={ig_stats['followers']} posts={ig_stats['posts']}"
+            )
             return rows
         finally:
             try:
@@ -1696,7 +1815,13 @@ class AthleteApp(tk.Tk):
             except Exception:
                 pass
 
-    def _build_player_struct(self, name: str, ig_username: Optional[str]) -> dict:
+    def _build_player_struct(
+        self,
+        name: str,
+        ig_username: Optional[str],
+        wikidata_qid: Optional[str] = None,
+        club_hint: str = "",
+    ) -> dict:
         """Build final player structure with Wikipedia -> Wikidata fallback. Never raises."""
         out = {
             "name": name,
@@ -1708,10 +1833,21 @@ class AthleteApp(tk.Tk):
             "posts": None,
             "bio": None,
         }
+        handle_source = "input" if out.get("instagram") else "none"
 
-        # Wikidata fallback
+        # Wikidata: prefer direct item (resolved from Wikipedia) to avoid homonyms.
         try:
-            qid = wikidata_search_entity(name)
+            qid = (wikidata_qid or "").strip() or None
+            if qid:
+                append_log(f"Wikidata {name}: item direct {qid}")
+            if not qid:
+                qid = wikipedia_resolve_wikidata_qid(name, club_hint=club_hint)
+                if qid:
+                    append_log(f"Wikidata {name}: item via Wikipedia {qid}")
+            if not qid:
+                qid = wikidata_search_entity(name)
+                if qid:
+                    append_log(f"Wikidata {name}: fallback recherche texte {qid}")
             if qid:
                 wd = wikidata_get_entity(qid)
                 ent = wd.get("entities", {}).get(qid, {})
@@ -1740,62 +1876,68 @@ class AthleteApp(tk.Tk):
         except Exception as e:
             append_log(f"Wikidata échoué pour {name}: {e}")
 
+        # Fast mode: skip Instagram network lookups entirely for speed/stability.
+        if self._ig_fast_mode_current:
+            append_log(f"[IG] {name}: mode rapide actif, recherche Instagram désactivée")
+            return out
+
         # If no Instagram handle found via Wikidata, try lightweight DDG lookup (single HTTP query).
         if not out.get("instagram"):
             try:
                 key = (name or "").strip().lower()
-                cached_handle = self._ig_handle_cache.get(key)
-                if cached_handle:
-                    valid_cached = normalize_instagram_handle(cached_handle)
-                    if valid_cached and not valid_cached.lstrip("@").startswith("popular"):
-                        out["instagram"] = valid_cached
-                        append_log(f"[IG] {name}: handle cache {valid_cached}")
-                    else:
-                        append_log(f"[IG] {name}: handle cache ignoré (invalide)")
-                        self._ig_handle_cache.pop(key, None)
+                # Manual trusted mapping FIRST: avoids stale/empty cache preventing real attempts.
+                manual_handle = PLAYER_IG_HINTS.get(key)
+                if manual_handle:
+                    manual_norm = normalize_instagram_handle(manual_handle)
+                    if manual_norm:
+                        out["instagram"] = manual_norm
+                        handle_source = "manual"
+                        self._ig_handle_cache[key] = manual_norm
                         self._save_ig_handle_cache()
-                else:
-                    # Manual trusted mapping (most reliable when search engines block bots).
-                    manual_handle = PLAYER_IG_HINTS.get(key)
-                    if manual_handle:
-                        manual_norm = normalize_instagram_handle(manual_handle)
-                        if manual_norm:
-                            out["instagram"] = manual_norm
-                            self._ig_handle_cache[key] = manual_norm
-                            self._save_ig_handle_cache()
-                            append_log(f"[IG] {name}: handle manuel {manual_norm}")
-                    if out.get("instagram"):
-                        guessed = out.get("instagram")
-                    else:
-                        guessed = None
+                        append_log(f"[IG] {name}: handle manuel {manual_norm}")
 
-                    if not guessed:
-                        append_log(f"[IG] {name}: handle absent, tentative résolution DDG HTTP")
-                        guessed = self._resolve_instagram_handle_http(name)
-                    if (not guessed) and (not IG_FAST_MODE):
-                        append_log(f"[IG] {name}: DDG HTTP vide, tentative résolution Google")
-                        guessed = self._resolve_instagram_handle_google(name, "PSG")
-                    # Keep selenium DDG as last resort only.
-                    if (not guessed) and (not IG_FAST_MODE):
-                        append_log(f"[IG] {name}: Google vide, tentative résolution selenium DDG")
-                        guessed = self._resolve_instagram_handle_selenium(name)
-                    if (not guessed) and IG_FAST_MODE:
-                        append_log(f"[IG] {name}: mode rapide actif, fallback Google/Selenium ignoré")
-                    if guessed:
-                        guessed_norm = normalize_instagram_handle(guessed)
-                        if not guessed_norm or guessed_norm.lstrip("@").startswith("popular"):
-                            append_log(f"[IG] {name}: handle rejeté (invalide) {guessed}")
-                            guessed_norm = None
-                        if guessed_norm:
-                            out["instagram"] = guessed_norm
-                            self._ig_handle_cache[key] = guessed_norm
-                            self._save_ig_handle_cache()
-                            if guessed_norm != out.get("instagram"):
-                                append_log(f"[IG] {name}: handle trouvé {guessed_norm}")
+                if not out.get("instagram"):
+                    cached_handle = self._ig_handle_cache.get(key)
+                    if cached_handle:
+                        valid_cached = normalize_instagram_handle(cached_handle)
+                        if valid_cached and not valid_cached.lstrip("@").startswith("popular"):
+                            out["instagram"] = valid_cached
+                            handle_source = "cache"
+                            append_log(f"[IG] {name}: handle cache {valid_cached}")
                         else:
-                            append_log(f"[IG] {name}: handle introuvable")
+                            append_log(f"[IG] {name}: handle cache ignoré (invalide)")
+                            self._ig_handle_cache.pop(key, None)
+                            self._save_ig_handle_cache()
+
+                guessed = out.get("instagram") if out.get("instagram") else None
+
+                if (not guessed) and (not self._ig_fast_mode_current):
+                    append_log(f"[IG] {name}: handle absent, tentative résolution Google")
+                    guessed = self._resolve_instagram_handle_google(name, club_hint or "PSG")
+                if not guessed:
+                    append_log(f"[IG] {name}: handle absent, tentative résolution DDG HTTP")
+                    guessed = self._resolve_instagram_handle_http(name)
+                # Keep selenium DDG as last resort only.
+                if (not guessed) and (not self._ig_fast_mode_current):
+                    append_log(f"[IG] {name}: DDG/Google vides, tentative résolution selenium DDG")
+                    guessed = self._resolve_instagram_handle_selenium(name)
+                if (not guessed) and self._ig_fast_mode_current:
+                    append_log(f"[IG] {name}: mode rapide actif, fallback Google/Selenium ignoré")
+                if guessed:
+                    guessed_norm = normalize_instagram_handle(guessed)
+                    if not guessed_norm or guessed_norm.lstrip("@").startswith("popular"):
+                        append_log(f"[IG] {name}: handle rejeté (invalide) {guessed}")
+                        guessed_norm = None
+                    if guessed_norm:
+                        out["instagram"] = guessed_norm
+                        handle_source = "discovered"
+                        self._ig_handle_cache[key] = guessed_norm
+                        self._save_ig_handle_cache()
+                        append_log(f"[IG] {name}: handle trouvé {guessed_norm}")
                     else:
                         append_log(f"[IG] {name}: handle introuvable")
+                else:
+                    append_log(f"[IG] {name}: handle introuvable")
             except Exception:
                 append_log(f"[IG] {name}: erreur résolution handle")
                 pass
@@ -1811,7 +1953,12 @@ class AthleteApp(tk.Tk):
             if ig_url:
                 append_log(f"[IG] {name}: scraping {ig_url}")
                 if self._ig_scraper is not None:
-                    ig_data = self._ig_scraper.get_profile(ig_url.rstrip("/").split("/")[-1])
+                    # Force refresh for trusted/manual or newly discovered handle to avoid stale empty cache.
+                    force_ig = handle_source in ("manual", "discovered")
+                    ig_data = self._ig_scraper.get_profile(
+                        ig_url.rstrip("/").split("/")[-1],
+                        force_refresh=force_ig,
+                    )
                     if ig_data.get("bio"):
                         out["bio"] = ig_data["bio"]
                     if ig_data.get("posts") is not None:
@@ -2140,14 +2287,16 @@ class AthleteApp(tk.Tk):
                 pass
         raw = unquote(raw)
         raw = html.unescape(raw)
-        if "instagram.com/" not in raw:
+        if "instagram.com/" not in raw.lower():
             return None
-        # keep only profile-like URLs
-        clean = raw.split("?", 1)[0].split("#", 1)[0].rstrip("/")
-        tail = clean.split("/")[-1].lower() if "/" in clean else ""
-        if not tail or tail in ("p", "reel", "explore", "accounts", "stories"):
+        # Extract first profile-like segment robustly from noisy search hrefs.
+        m = re.search(r"instagram\.com/([A-Za-z0-9._]+)/?", raw, re.IGNORECASE)
+        if not m:
             return None
-        return clean
+        tail = (m.group(1) or "").strip().lower()
+        if not tail or tail in ("p", "reel", "explore", "accounts", "stories", "popular"):
+            return None
+        return f"https://www.instagram.com/{tail}/"
 
     def _extract_instagram_handles_from_text(self, text: str) -> List[str]:
         out: List[str] = []

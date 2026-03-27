@@ -43,7 +43,13 @@ class InstagramScraper:
         self._cache = {}
         self._last_request_ts = 0.0
         self._burst_count = 0
+        self._degraded_until_by_user = {}
+        self._last_json_status_by_user = {}
+        self._fast_mode = False
         self._load_cache()
+
+    def set_fast_mode(self, enabled: bool) -> None:
+        self._fast_mode = bool(enabled)
 
     def _load_cache(self) -> None:
         try:
@@ -82,14 +88,18 @@ class InstagramScraper:
         time.sleep(random.uniform(float(min_s), float(max_s)))
 
     def _throttle(self) -> None:
-        # Global rule: max 1 request every 15 seconds.
+        # Dynamic rate-limit: aggressive in fast mode, conservative otherwise.
+        min_interval = 2.0 if self._fast_mode else 15.0
         now = time.time()
         elapsed = now - self._last_request_ts
-        if elapsed < 15.0:
-            time.sleep(15.0 - elapsed)
+        if elapsed < min_interval:
+            time.sleep(min_interval - elapsed)
 
-        # Burst rule: after 20 profiles, pause 2-5 minutes.
-        if self._burst_count >= 20:
+        # Burst rule.
+        if self._fast_mode and self._burst_count >= 40:
+            self._sleep_jitter(15, 30)
+            self._burst_count = 0
+        elif (not self._fast_mode) and self._burst_count >= 20:
             self._sleep_jitter(120, 300)
             self._burst_count = 0
 
@@ -113,6 +123,48 @@ class InstagramScraper:
             self._log(f"[IG] @{username} HTTP {r.status_code}")
             return ""
         return r.text or ""
+
+    def _http_get_profile_json(self, username: str) -> dict | None:
+        """
+        Try Instagram web profile info endpoint (more stable than HTML regex in many cases).
+        Returns parsed dict or None.
+        """
+        self._throttle()
+        u = username.strip().lstrip("@")
+        url = f"https://i.instagram.com/api/v1/users/web_profile_info/?username={u}"
+        headers = {
+            "User-Agent": self._random_ua(),
+            "Accept": "application/json",
+            "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+            "Referer": f"https://www.instagram.com/{u}/",
+            # Public web app id commonly used by browser requests.
+            "x-ig-app-id": "936619743392459",
+        }
+        try:
+            r = requests.get(url, headers=headers, timeout=20)
+            self._last_request_ts = time.time()
+            self._burst_count += 1
+            self._last_json_status_by_user[u] = int(r.status_code)
+            self._log(f"[IG] @{u} JSON HTTP {r.status_code}")
+            if r.status_code in (401, 403, 404, 429):
+                return None
+            if r.status_code >= 400:
+                return None
+            data = r.json()
+            user = ((data or {}).get("data") or {}).get("user") or {}
+            if not user:
+                return None
+            followers = user.get("edge_followed_by", {}).get("count")
+            posts = user.get("edge_owner_to_timeline_media", {}).get("count")
+            bio = (user.get("biography") or "").strip() or None
+            return {
+                "username": u,
+                "followers": int(followers) if isinstance(followers, int) else None,
+                "posts": int(posts) if isinstance(posts, int) else None,
+                "bio": bio,
+            }
+        except Exception:
+            return None
 
     def _looks_blocked(self, html_text: str) -> bool:
         if not html_text:
@@ -219,14 +271,22 @@ class InstagramScraper:
         except Exception:
             return ""
 
-    def get_profile(self, username: str) -> dict:
+    def get_profile(self, username: str, force_refresh: bool = False) -> dict:
         u = (username or "").strip().lstrip("@")
         if not u:
             return {"username": "", "followers": None, "posts": None, "bio": None}
 
+        # Fast-fail window when Instagram public surface is temporarily unusable for this handle.
+        now = time.time()
+        degraded_until = float(self._degraded_until_by_user.get(u) or 0.0)
+        if now < degraded_until:
+            remaining = int(degraded_until - now)
+            self._log(f"[IG] @{u} skip scrape (degraded mode handle {remaining}s)")
+            return {"username": u, "followers": None, "posts": None, "bio": None}
+
         # Cache with TTL to keep data relatively fresh.
         cached = self._cache.get(u)
-        if isinstance(cached, dict):
+        if (not force_refresh) and isinstance(cached, dict):
             cached_has_data = bool(
                 cached.get("bio")
                 or cached.get("followers") is not None
@@ -246,6 +306,15 @@ class InstagramScraper:
                         "posts": cached.get("posts"),
                         "bio": cached.get("bio"),
                     }
+                # Negative cache: avoid hammering same empty profile for 1 hour.
+                if (not cached_has_data) and age_s <= 3600:
+                    self._log(f"[IG] @{u} cache hit (empty-recent, age={int(age_s)}s)")
+                    return {
+                        "username": cached.get("username") or u,
+                        "followers": None,
+                        "posts": None,
+                        "bio": None,
+                    }
                 if not cached_has_data:
                     self._log(f"[IG] @{u} cache empty expired (age={int(age_s)}s), refresh")
             # legacy entries without timestamp: keep them for 1 day then refresh
@@ -260,11 +329,34 @@ class InstagramScraper:
                     "posts": cached.get("posts"),
                     "bio": cached.get("bio"),
                 }
+        elif force_refresh:
+            self._log(f"[IG] @{u} force refresh requested")
 
-        # Anti-block: wait between 8 and 20 seconds between profiles.
-        self._sleep_jitter(8, 20)
+        # Anti-block pacing between profile attempts.
+        if self._fast_mode:
+            self._sleep_jitter(0.4, 1.2)
+        else:
+            self._sleep_jitter(8, 20)
         self._log(f"[IG] @{u} fetch start")
 
+        # Step 1: JSON endpoint first
+        json_data = self._http_get_profile_json(u)
+        if json_data is not None:
+            self._log(
+                f"[IG] @{u} JSON parsed followers={json_data.get('followers')} "
+                f"posts={json_data.get('posts')} bio={'yes' if json_data.get('bio') else 'no'}"
+            )
+            self._cache[u] = {
+                "username": json_data.get("username") or u,
+                "followers": json_data.get("followers"),
+                "posts": json_data.get("posts"),
+                "bio": json_data.get("bio"),
+                "updated_at": time.time(),
+            }
+            self._save_cache()
+            return json_data
+
+        # Step 2: HTML fallback
         last = None
         for attempt in range(1, 4):
             self._log(f"[IG] @{u} attempt {attempt}/3")
@@ -293,6 +385,46 @@ class InstagramScraper:
             self._log(
                 f"[IG] @{u} parsed followers={data.get('followers')} posts={data.get('posts')} bio={'yes' if data.get('bio') else 'no'}"
             )
+            # If HTML parse succeeds technically but yields empty fields, try Selenium once as deep fallback.
+            if (
+                self.allow_selenium_fallback
+                and data.get("followers") is None
+                and data.get("posts") is None
+                and not data.get("bio")
+            ):
+                self._log(f"[IG] @{u} html parse empty, try selenium deep fallback")
+                src = self._selenium_page_source(u)
+                if src and not self._looks_blocked(src):
+                    data2 = self._parse_from_html(u, src)
+                    if data2.get("followers") is not None or data2.get("posts") is not None or data2.get("bio"):
+                        data = data2
+                        self._log(
+                            f"[IG] @{u} selenium parsed followers={data.get('followers')} posts={data.get('posts')} bio={'yes' if data.get('bio') else 'no'}"
+                        )
+        # Compact diagnostic line for quick troubleshooting in app logs.
+        if (
+            data.get("followers") is None
+            and data.get("posts") is None
+            and not data.get("bio")
+        ):
+            json_status = self._last_json_status_by_user.get(u)
+            html_state = "missing"
+            if last:
+                html_state = "blocked" if self._looks_blocked(last) else "no-markers"
+            self._log(
+                f"[IG] @{u} diagnostic: empty data "
+                f"(json_http={json_status if json_status is not None else 'n/a'}, html={html_state})"
+            )
+
+        # If both JSON and HTML yielded no usable data, pause scraping attempts for a short period.
+        if (
+            json_data is None
+            and data.get("followers") is None
+            and data.get("posts") is None
+            and not data.get("bio")
+        ):
+            self._degraded_until_by_user[u] = time.time() + 600  # 10 min per handle
+            self._log(f"[IG] @{u} degraded mode enabled for handle (600s)")
 
         self._cache[u] = {
             "username": data.get("username") or u,
@@ -306,11 +438,20 @@ class InstagramScraper:
 
     def probe(self) -> bool:
         """
-        Quick startup probe. Returns True if public scrape seems to work.
+        Quick startup probe. Cache-only to avoid wasting requests at startup.
         """
         try:
-            data = self.get_profile("instagram")
-            return bool(data.get("followers") or data.get("posts") or data.get("bio"))
+            cached = self._cache.get("instagram")
+            if not isinstance(cached, dict):
+                self._log("[IG] probe cache-miss")
+                return False
+            has_data = bool(
+                cached.get("bio")
+                or cached.get("followers") is not None
+                or cached.get("posts") is not None
+            )
+            self._log(f"[IG] probe cache {'ok' if has_data else 'empty'}")
+            return has_data
         except Exception:
             return False
 

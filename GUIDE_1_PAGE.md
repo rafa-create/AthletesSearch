@@ -20,7 +20,7 @@ Un message apparait pendant le traitement: `Recherche en cours...`
 
 Le dossier par defaut est:
 
-`C:/Sportifs/Data/`
+`./Data/`
 
 ## 4) En cas d'erreur Instagram
 

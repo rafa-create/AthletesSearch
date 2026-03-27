@@ -30,12 +30,11 @@ Livrable:
 
 Au premier lancement, l'application cree:
 
-- `C:/Sportifs/Data/sportifs.csv`
-- `C:/Sportifs/Logs/`
+- `./Data/sportifs.csv`
+- `./.appdata/logs/`
 
 ## Notes importantes
 
-- Limite de 20 profils par recherche.
-- Pause de 5 secondes entre profils Instagram pour limiter le risque de blocage.
+- Delai dynamique Instagram: tres court en mode rapide, plus prudent en mode complet.
 - Si Instagram bloque, l'application affiche un message demandant de reessayer plus tard ou d'utiliser un VPN.
 - Colonnes `Nombre de points` et `Niveau Bareme` laissees vides (comme demande).
