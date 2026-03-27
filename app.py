@@ -151,7 +151,10 @@ def append_log(text: str) -> None:
         f.write(f"[{dt.datetime.now().isoformat(sep=' ', timespec='seconds')}] {text}\n")
     if logger is not None:
         try:
-            logger.add(log_path, rotation="2 MB", retention=5)
+            # Keep Loguru only as console logger here.
+            # File persistence is already handled by the manual write above.
+            # Adding a file sink on each call creates duplicated handlers and
+            # can trigger Windows file-lock/rotation errors.
             logger.info(text)
         except Exception:
             pass
@@ -1902,12 +1905,7 @@ class AthleteApp(tk.Tk):
         except Exception as e:
             append_log(f"Wikidata échoué pour {name}: {e}")
 
-        # Fast mode: skip Instagram network lookups entirely for speed/stability.
-        if self._ig_fast_mode_current:
-            append_log(f"[IG] {name}: mode rapide actif, recherche Instagram désactivée")
-            return out
-
-        # If no Instagram handle found via Wikidata, try lightweight DDG lookup (single HTTP query).
+        # If no Instagram handle found via Wikidata, try local sources then (optionally) web discovery.
         if not out.get("instagram"):
             try:
                 key = (name or "").strip().lower()
@@ -1936,19 +1934,25 @@ class AthleteApp(tk.Tk):
                             self._save_ig_handle_cache()
 
                 guessed = out.get("instagram") if out.get("instagram") else None
+                guessed_preexisting = bool(guessed)
 
                 if (not guessed) and (not self._ig_fast_mode_current):
                     append_log(f"[IG] {name}: handle absent, tentative résolution Google")
                     guessed = self._resolve_instagram_handle_google(name, club_hint or "PSG")
                 if not guessed:
-                    append_log(f"[IG] {name}: handle absent, tentative résolution DDG HTTP")
-                    guessed = self._resolve_instagram_handle_http(name)
-                # Keep selenium DDG as last resort only.
+                    if self._ig_fast_mode_current:
+                        append_log(f"[IG] {name}: handle absent, DDG HTTP (premier lien, mode rapide)")
+                        guessed = self._resolve_instagram_handle_http(name, fast_first=True)
+                        if not guessed:
+                            append_log(f"[IG] {name}: DDG vide, tentative Google HTTP (premier lien)")
+                            guessed = self._resolve_instagram_handle_google_http_first(name, club_hint or "PSG")
+                    else:
+                        append_log(f"[IG] {name}: handle absent, tentative résolution DDG HTTP")
+                        guessed = self._resolve_instagram_handle_http(name, fast_first=False)
+                # Keep selenium DDG as last resort only (mode complet).
                 if (not guessed) and (not self._ig_fast_mode_current):
                     append_log(f"[IG] {name}: DDG/Google vides, tentative résolution selenium DDG")
                     guessed = self._resolve_instagram_handle_selenium(name)
-                if (not guessed) and self._ig_fast_mode_current:
-                    append_log(f"[IG] {name}: mode rapide actif, fallback Google/Selenium ignoré")
                 if guessed:
                     guessed_norm = normalize_instagram_handle(guessed)
                     if not guessed_norm or guessed_norm.lstrip("@").startswith("popular"):
@@ -1956,7 +1960,9 @@ class AthleteApp(tk.Tk):
                         guessed_norm = None
                     if guessed_norm:
                         out["instagram"] = guessed_norm
-                        handle_source = "discovered"
+                        # Preserve original source (manual/cache/wikidata/input) when handle already existed.
+                        if not guessed_preexisting:
+                            handle_source = "discovered"
                         self._ig_handle_cache[key] = guessed_norm
                         self._save_ig_handle_cache()
                         append_log(f"[IG] {name}: handle trouvé {guessed_norm}")
@@ -1968,7 +1974,7 @@ class AthleteApp(tk.Tk):
                 append_log(f"[IG] {name}: erreur résolution handle")
                 pass
 
-        # Instagram public fallback (silent): scrape only when we have a handle/url.
+        # Instagram public fallback: scrape bio/followers when we have a handle (skipped in fast mode).
         try:
             ig = out.get("instagram")
             ig_url = None
@@ -1976,7 +1982,11 @@ class AthleteApp(tk.Tk):
                 ig_url = f"https://www.instagram.com/{ig[1:]}"
             elif isinstance(ig, str) and "instagram.com" in ig:
                 ig_url = ig
-            if ig_url:
+            if not ig_url:
+                append_log(f"[IG] {name}: scraping ignoré (pas d'URL instagram)")
+            elif self._ig_fast_mode_current:
+                append_log(f"[IG] {name}: mode rapide, scraping Instagram désactivé (handle conservé)")
+            else:
                 append_log(f"[IG] {name}: scraping {ig_url}")
                 if self._ig_scraper is not None:
                     # Force refresh for trusted/manual or newly discovered handle to avoid stale empty cache.
@@ -2003,8 +2013,6 @@ class AthleteApp(tk.Tk):
                     f"[IG] {name}: résultat bio={'oui' if out.get('bio') else 'non'} "
                     f"followers={out.get('followers')} posts={out.get('posts')}"
                 )
-            else:
-                append_log(f"[IG] {name}: scraping ignoré (pas d'URL instagram)")
         except Exception:
             append_log(f"[IG] {name}: erreur scraping")
             pass
@@ -2249,9 +2257,10 @@ class AthleteApp(tk.Tk):
 
     def _extract_instagram_links_from_html(self, html_text: str) -> List[str]:
         out: List[str] = []
+        t = html_text or ""
         # DuckDuckGo HTML often embeds target URLs in "uddg=<urlencoded>".
         # Important: stop at '&' to avoid keeping '&rut=...' tracking tokens.
-        for m in re.findall(r"uddg=([^&\"'\s>]+)", html_text):
+        for m in re.findall(r"uddg=([^&\"'\s>]+)", t, flags=re.IGNORECASE):
             try:
                 decoded = requests.utils.unquote(m)
             except Exception:
@@ -2259,8 +2268,31 @@ class AthleteApp(tk.Tk):
             decoded = html.unescape(decoded)
             if "instagram.com/" in decoded:
                 out.append(decoded)
-        # Fallback direct URL extraction.
-        for m in re.findall(r"https?://(?:www\.)?instagram\.com/[A-Za-z0-9._/]+", html_text):
+        # Alternate DDG encodings (lite / redirects).
+        for m in re.findall(
+            r"(?:https?:)?//(?:www\.)?duckduckgo\.com/l/\?[^\"'\s>]*uddg=([^&\"'\s>]+)",
+            t,
+            flags=re.IGNORECASE,
+        ):
+            try:
+                decoded = requests.utils.unquote(m)
+            except Exception:
+                decoded = m
+            decoded = html.unescape(decoded)
+            if "instagram.com/" in decoded:
+                out.append(decoded)
+        # Direct hrefs to instagram (lite HTML, some SERP layouts).
+        for m in re.findall(
+            r'href=["\'](https?://(?:www\.)?instagram\.com/[A-Za-z0-9._/?#]+)',
+            t,
+            flags=re.IGNORECASE,
+        ):
+            out.append(html.unescape(m))
+        # Escaped URLs inside JSON/scripts.
+        for m in re.findall(r"https?:\\?/\\?/(?:www\.)?instagram\.com/[A-Za-z0-9._/]+", t):
+            out.append(m.replace("\\", ""))
+        # Fallback direct URL extraction (whole page).
+        for m in re.findall(r"https?://(?:www\.)?instagram\.com/[A-Za-z0-9._/]+", t):
             out.append(html.unescape(m))
         # De-duplicate while preserving order.
         seen = set()
@@ -2277,6 +2309,18 @@ class AthleteApp(tk.Tk):
             seen.add(u)
             uniq.append(u)
         return uniq
+
+    def _first_valid_instagram_handle_from_links(self, links: List[str]) -> Optional[str]:
+        """Premier lien qui correspond à un profil /user/ (exclut /p/, /reel/, etc.)."""
+        for link in links[:25]:
+            handle = normalize_instagram_handle(link)
+            if not handle:
+                continue
+            u = handle.lstrip("@").lower()
+            if u in ("p", "reel", "explore", "accounts", "stories", "popular"):
+                continue
+            return handle
+        return None
 
     def _extract_instagram_profile_from_search_href(self, href: str) -> Optional[str]:
         """
@@ -2358,29 +2402,165 @@ class AthleteApp(tk.Tk):
             uniq.append(h)
         return uniq
 
-    def _resolve_instagram_handle_http(self, name: str) -> Optional[str]:
+    def _instagram_handle_from_ddgs(self, name: str, fast_first: bool) -> Optional[str]:
+        """
+        Utilise le paquet duckduckgo-search (résultats structurés, proche du navigateur).
+        Une simple requête HTTP sur duckduckgo.com/html renvoie souvent du HTML vide pour les scripts.
+        """
+        try:
+            from duckduckgo_search import DDGS
+        except ImportError:
+            append_log("[IG] Installez duckduckgo-search: pip install duckduckgo-search")
+            return None
+        queries = [
+            f'"{name}" instagram',
+            f"{name} instagram",
+            f"instagram {name}",
+        ]
+
+        def links_from_rows(rows: List[dict]) -> List[str]:
+            out: List[str] = []
+            for r in rows:
+                href = (r.get("href") or r.get("url") or "").strip()
+                if href and "instagram.com" in href.lower():
+                    out.append(href)
+                blob = f"{r.get('body') or ''} {r.get('title') or ''}"
+                for m in re.findall(
+                    r"https?://(?:www\.)?instagram\.com/[A-Za-z0-9._/?#-]+", blob, flags=re.I
+                ):
+                    out.append(m.split("?")[0].split("#")[0])
+            return out
+
+        merged: List[str] = []
+        for q in queries:
+            try:
+                time.sleep(0.35)
+                ddgs = DDGS()
+                rows = list(ddgs.text(q, max_results=25))
+                batch = links_from_rows(rows)
+                append_log(f"[IG] {name}: DDGS {len(rows)} résultat(s), {len(batch)} lien(s) IG pour «{q[:44]}…»")
+                if fast_first:
+                    picked = self._first_valid_instagram_handle_from_links(batch)
+                    if picked:
+                        append_log(f"[IG] {name}: DDGS — premier profil {picked}")
+                        return picked
+                else:
+                    merged.extend(batch)
+            except Exception as ex:
+                append_log(f"[IG] {name}: DDGS erreur ({q[:32]}…): {ex}")
+                continue
+
+        if fast_first:
+            return None
+
+        if not merged:
+            return None
+        seen = set()
+        uniq: List[str] = []
+        for u in merged:
+            u = u.split("?")[0].split("#")[0].rstrip("/")
+            if u in seen:
+                continue
+            seen.add(u)
+            uniq.append(u)
+        name_tokens = [t.lower() for t in re.findall(r"[A-Za-zÀ-ÿ]+", name or "") if len(t) >= 3]
+        best = None
+        best_score = -1.0
+        for link in uniq[:24]:
+            handle = normalize_instagram_handle(link)
+            if not handle:
+                continue
+            u = handle.lstrip("@").lower()
+            if u in ("p", "reel", "explore", "accounts"):
+                continue
+            score = 0.0
+            for t in name_tokens:
+                if t in u:
+                    score += 2.0
+            score -= max(0, len(u) - 20) * 0.05
+            if score > best_score:
+                best_score = score
+                best = handle
+        if best_score > 0 and best:
+            append_log(f"[IG] {name}: DDGS handle retenu (score) {best}")
+            return best
+        picked = self._first_valid_instagram_handle_from_links(uniq)
+        if picked:
+            append_log(f"[IG] {name}: DDGS fallback premier lien {picked}")
+            return picked
+        return None
+
+    def _resolve_instagram_handle_http(self, name: str, fast_first: bool = False) -> Optional[str]:
         """
         Lightweight DDG lookup to find an Instagram profile URL for a player name.
         Returns normalized handle like '@username' or None.
+        If fast_first is True (mode rapide), take the first valid profile link (like a web search),
+        instead of scoring by name tokens in the username (often absent e.g. motya_39).
         """
-        q = f'site:instagram.com "{name}" football'
-        url = f"https://duckduckgo.com/html/?q={quote_plus(q)}"
+        via = self._instagram_handle_from_ddgs(name, fast_first=fast_first)
+        if via:
+            return via
+
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
             ),
             "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+            "Referer": "https://duckduckgo.com/",
         }
+        # Several queries + HTML endpoints: DDG often returns empty/minimal HTML on one combination.
+        queries = [
+            f'"{name}" instagram',
+            f'site:instagram.com "{name}" football',
+            f"{name} instagram",
+        ]
+        endpoints = [
+            "https://html.duckduckgo.com/html/?q=",
+            "https://duckduckgo.com/html/?q=",
+            "https://lite.duckduckgo.com/lite/?q=",
+        ]
         try:
             append_log(f"[IG] {name}: DDG lookup handle")
-            resp = requests.get(url, headers=headers, timeout=15)
-            if resp.status_code >= 400:
-                append_log(f"[IG] {name}: DDG HTTP {resp.status_code}")
+            links: List[str] = []
+            last_status = None
+            for q in queries:
+                for ep in endpoints:
+                    url = f"{ep}{quote_plus(q)}"
+                    try:
+                        resp = requests.get(url, headers=headers, timeout=18)
+                        last_status = resp.status_code
+                        if resp.status_code >= 400:
+                            continue
+                        body = resp.text or ""
+                        batch = self._extract_instagram_links_from_html(body)
+                        if not batch:
+                            continue
+                        host = ep.split("/")[2]
+                        append_log(f"[IG] {name}: DDG liens extraits ({len(batch)}) via {host}")
+                        if fast_first:
+                            picked = self._first_valid_instagram_handle_from_links(batch)
+                            if picked:
+                                append_log(f"[IG] {name}: DDG premier lien retenu {picked}")
+                                return picked
+                            append_log(f"[IG] {name}: DDG liens non profils, autre tentative…")
+                            continue
+                        links = batch
+                        append_log(f"[IG] {name}: DDG liens trouvés ({len(links)}) via {host}")
+                        break
+                    except Exception:
+                        continue
+                if links:
+                    break
+            if fast_first:
+                append_log(f"[IG] {name}: DDG aucun profil Instagram exploitable après tentatives")
                 return None
-            links = self._extract_instagram_links_from_html(resp.text or "")
             if not links:
-                append_log(f"[IG] {name}: DDG aucun lien instagram")
+                append_log(
+                    f"[IG] {name}: DDG aucun lien instagram"
+                    + (f" (dernier HTTP {last_status})" if last_status is not None else "")
+                )
                 return None
 
             name_tokens = [t.lower() for t in re.findall(r"[A-Za-zÀ-ÿ]+", name or "") if len(t) >= 3]
@@ -2409,6 +2589,48 @@ class AthleteApp(tk.Tk):
             return None
         except Exception:
             append_log(f"[IG] {name}: DDG erreur")
+            return None
+
+    def _resolve_instagram_handle_google_http_first(self, name: str, club_hint: str = "") -> Optional[str]:
+        """
+        Lightweight Google HTTP lookup (no Selenium): keep the first valid Instagram profile link.
+        Useful when DDG returns empty SERP to script requests.
+        """
+        q = f'"{name}" instagram {club_hint}'.strip()
+        url = f"https://www.google.com/search?hl=fr&num=10&q={quote_plus(q)}"
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            ),
+            "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+            "Referer": "https://www.google.com/",
+        }
+        try:
+            append_log(f"[IG] {name}: Google HTTP lookup handle")
+            resp = requests.get(url, headers=headers, timeout=18)
+            if resp.status_code >= 400:
+                append_log(f"[IG] {name}: Google HTTP {resp.status_code}")
+                return None
+            body = resp.text or ""
+            candidates: List[str] = []
+
+            for m in re.findall(r'href="(/url\?q=[^"]+)"', body):
+                profile = self._extract_instagram_profile_from_search_href(m)
+                if profile:
+                    candidates.append(profile)
+            for m in re.findall(r"https?://(?:www\.)?instagram\.com/[A-Za-z0-9._/?#-]+", body, flags=re.I):
+                candidates.append(m)
+
+            picked = self._first_valid_instagram_handle_from_links(candidates)
+            if picked:
+                append_log(f"[IG] {name}: Google HTTP premier lien retenu {picked}")
+                return picked
+            append_log(f"[IG] {name}: Google HTTP aucun profil instagram exploitable")
+            return None
+        except Exception:
+            append_log(f"[IG] {name}: Google HTTP erreur")
             return None
 
     def _resolve_instagram_handle_selenium(self, name: str) -> Optional[str]:

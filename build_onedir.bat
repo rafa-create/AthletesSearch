@@ -50,6 +50,7 @@ if "%CLEAN_BUILD%"=="1" (
   echo PyInstaller sans --clean ^(build incremental plus rapide^).
 )
 call "%BUILD_VENV%\Scripts\python.exe" -m PyInstaller !PI_OPTS! ^
+  --collect-submodules duckduckgo_search ^
   --collect-submodules selenium ^
   --collect-data selenium ^
   --exclude-module pkg_resources ^
