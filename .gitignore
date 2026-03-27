@@ -1,0 +1,25 @@
+# Python cache / bytecode
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build artifacts
+build/
+dist/
+release/
+
+# PyInstaller artifacts
+*.spec
+
+# Local runtime artifacts
+*.log
+.pytest_cache/
+.mypy_cache/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
