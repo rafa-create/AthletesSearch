@@ -167,6 +167,24 @@ LOG_SINK = None
 
 _NET_LAST_TS = {"wikipedia": 0.0, "wikidata": 0.0, "instagram": 0.0}
 _WIKIPEDIA_TITLE_CACHE: Dict[str, Optional[str]] = {}
+# Set during an active search so Wikipedia/Wikidata waits can be interrupted on cancel.
+_search_cancel_event_ref: Optional[threading.Event] = None
+
+
+def bind_search_cancel_event(ev: Optional[threading.Event]) -> None:
+    global _search_cancel_event_ref
+    _search_cancel_event_ref = ev
+
+
+def _sleep_interruptible(seconds: float) -> None:
+    """Sleep in short chunks; raise SearchCancelled if user cancelled the search."""
+    if seconds <= 0:
+        return
+    end = time.time() + float(seconds)
+    while time.time() < end:
+        if _search_cancel_event_ref is not None and _search_cancel_event_ref.is_set():
+            raise SearchCancelled("Recherche annulée.")
+        time.sleep(min(0.2, max(0.0, end - time.time())))
 
 
 class RetryManager:
@@ -202,14 +220,16 @@ class RetryManager:
                         wait_s = max(base_wait, retry_after or 30)
                         # add jitter to avoid synchronized retries
                         wait_s = int(wait_s + random.uniform(0, 3))
-                        append_log(f"[RetryManager] {label} 429 Too Many Requests (attente {wait_s}s)")
-                        time.sleep(wait_s)
+                        # Cap: Wikimedia Retry-After can be very long; avoid blocking minutes.
+                        wait_s = min(wait_s, 25)
+                        append_log(f"[RetryManager] {label} 429 Too Many Requests (attente {wait_s}s max)")
+                        _sleep_interruptible(wait_s)
                         last_exc = e
                         continue
                 last_exc = e
                 wait_s = self.backoff[min(attempt - 1, len(self.backoff) - 1)]
                 append_log(f"[RetryManager] {label} échec: {e} (attente {wait_s}s)")
-                time.sleep(wait_s)
+                _sleep_interruptible(wait_s)
         raise last_exc
 
 
@@ -238,7 +258,11 @@ def http_get(url: str, timeout: int = 20) -> requests.Response:
         now = time.time()
         elapsed = now - _NET_LAST_TS.get(key, 0.0)
         if elapsed < min_interval:
-            time.sleep(min_interval - elapsed)
+            gap = min_interval - elapsed
+            if _search_cancel_event_ref is not None:
+                _sleep_interruptible(gap)
+            else:
+                time.sleep(gap)
 
     ua = UA.random if UA is not None else (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -1366,6 +1390,7 @@ class AthleteApp(tk.Tk):
 
     def _run_search(self, filters: SearchFilters) -> None:
         try:
+            bind_search_cancel_event(self._search_cancel_event)
             self._raise_if_cancelled()
             rows = self._search_players_then_instagram(filters)
             self._raise_if_cancelled()
@@ -1392,6 +1417,7 @@ class AthleteApp(tk.Tk):
             append_log(traceback.format_exc())
             self.after(0, lambda: messagebox.showerror(APP_TITLE, self._format_user_error(exc)))
         finally:
+            bind_search_cancel_event(None)
             self.after(0, self._close_search_dialog)
             self.after(0, lambda: self.search_btn.configure(state="normal"))
 
