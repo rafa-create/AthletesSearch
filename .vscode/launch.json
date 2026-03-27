@@ -2,9 +2,10 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Run Sportifs Manager",
-      "type": "python",
+      "name": "Run Athletes Searcher (.buildvenv)",
+      "type": "debugpy",
       "request": "launch",
+      "python": "${workspaceFolder}\\.buildvenv\\Scripts\\python.exe",
       "program": "${workspaceFolder}/app.py",
       "console": "integratedTerminal",
       "justMyCode": true

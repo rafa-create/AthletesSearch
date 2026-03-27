@@ -4,6 +4,8 @@ __pycache__/
 
 # Virtual environments
 .venv/
+.buildvenv/
+.buildenv/
 venv/
 env/
 
@@ -17,6 +19,8 @@ release/
 
 # Local runtime artifacts
 *.log
+*.csv
+*.json
 .pytest_cache/
 .mypy_cache/
 

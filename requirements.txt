@@ -1,4 +1,9 @@
-instaloader
-selenium
+requests
+beautifulsoup4
 pandas
-pyinstaller
+selenium
+webdriver-manager
+fake-useragent
+tenacity
+rich
+loguru
