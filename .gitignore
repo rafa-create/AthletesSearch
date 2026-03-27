@@ -21,6 +21,9 @@ release/
 *.log
 *.csv
 *.json
+.appdata/
+.appdata/instagram_cache.json
+.appdata/instagram_handle_cache.json
 .pytest_cache/
 .mypy_cache/
 

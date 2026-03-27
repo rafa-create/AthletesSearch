@@ -9,11 +9,12 @@ import socket
 import re
 import html
 import json
+import random
 from dataclasses import dataclass
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Dict, List, Optional
 import webbrowser
-from urllib.parse import quote_plus
+from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 import requests
 try:
     from bs4 import BeautifulSoup
@@ -27,6 +28,11 @@ try:
     from loguru import logger
 except Exception:
     logger = None
+
+try:
+    from instagram_scraper import InstagramScraper
+except Exception:
+    InstagramScraper = None
 
 webdriver = None
 WebDriverException = Exception
@@ -43,6 +49,8 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 BASE_DIR = r"C:/Sportifs"
 DATA_DIR = os.path.join(BASE_DIR, "Data")
 LOG_DIR = os.path.join(BASE_DIR, "Logs")
+# Local app runtime cache in current app folder
+CACHE_DIR = os.path.join(APP_DIR, ".appdata")
 _single_instance_socket = None
 # Instagram login removed (web-only)
 DEFAULT_SPORT = "foot"
@@ -55,6 +63,11 @@ CLUB_WIKIDATA_QIDS = {
     "paris saint-germain": "Q483020",
     "paris saint-germain f.c.": "Q483020",
 }
+PLAYER_IG_HINTS = {
+    # Manual trusted overrides (can be extended over time).
+    "lucas chevalier": "@_lc30_",
+}
+IG_FAST_MODE = True  # Skip heavy Google/Selenium handle lookups for faster runs.
 
 CSV_COLUMNS = [
     "Nom",
@@ -80,6 +93,7 @@ CSV_COLUMNS = [
 def ensure_app_folders() -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(LOG_DIR, exist_ok=True)
+    os.makedirs(CACHE_DIR, exist_ok=True)
 
 
 def now_str() -> str:
@@ -150,6 +164,10 @@ def append_log(text: str) -> None:
 LOG_SINK = None
 
 
+_NET_LAST_TS = {"wikipedia": 0.0, "wikidata": 0.0, "instagram": 0.0}
+_WIKIPEDIA_TITLE_CACHE: Dict[str, Optional[str]] = {}
+
+
 class RetryManager:
     retries = 3
     backoff = [2, 5, 10]
@@ -170,6 +188,23 @@ class RetryManager:
                     if status in (400, 401, 403, 404):
                         append_log(f"[RetryManager] {label} échec permanent HTTP {status}: {e}")
                         raise
+                    # 429: respect Retry-After when provided and slow down more aggressively.
+                    if status == 429:
+                        retry_after = None
+                        try:
+                            ra = (e.response.headers or {}).get("Retry-After")
+                            if ra and str(ra).strip().isdigit():
+                                retry_after = int(str(ra).strip())
+                        except Exception:
+                            retry_after = None
+                        base_wait = self.backoff[min(attempt - 1, len(self.backoff) - 1)]
+                        wait_s = max(base_wait, retry_after or 30)
+                        # add jitter to avoid synchronized retries
+                        wait_s = int(wait_s + random.uniform(0, 3))
+                        append_log(f"[RetryManager] {label} 429 Too Many Requests (attente {wait_s}s)")
+                        time.sleep(wait_s)
+                        last_exc = e
+                        continue
                 last_exc = e
                 wait_s = self.backoff[min(attempt - 1, len(self.backoff) - 1)]
                 append_log(f"[RetryManager] {label} échec: {e} (attente {wait_s}s)")
@@ -182,12 +217,113 @@ UA = UserAgent() if UserAgent is not None else None
 
 
 def http_get(url: str, timeout: int = 20) -> requests.Response:
+    # Polite throttling for Wikimedia endpoints to reduce 429.
+    # Wikipedia API is very sensitive to bursts.
+    lower = (url or "").lower()
+    if "wikipedia.org" in lower:
+        key = "wikipedia"
+        min_interval = 1.2
+    elif "wikidata.org" in lower:
+        key = "wikidata"
+        min_interval = 1.0
+    elif "instagram.com" in lower:
+        key = "instagram"
+        min_interval = 1.0
+    else:
+        key = None
+        min_interval = 0.0
+
+    if key is not None:
+        now = time.time()
+        elapsed = now - _NET_LAST_TS.get(key, 0.0)
+        if elapsed < min_interval:
+            time.sleep(min_interval - elapsed)
+
     ua = UA.random if UA is not None else (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
     )
-    headers = {"User-Agent": ua}
-    return requests.get(url, headers=headers, timeout=timeout)
+    headers = {
+        "User-Agent": f"{APP_NAME}/{APP_VERSION} (+local app) {ua}",
+        "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+    }
+    resp = requests.get(url, headers=headers, timeout=timeout)
+    if key is not None:
+        _NET_LAST_TS[key] = time.time()
+    return resp
+
+
+def _parse_int_maybe(text: str) -> Optional[int]:
+    if not text:
+        return None
+    t = text.strip().replace("\u202f", " ").replace("\xa0", " ")
+    # handle 12.3k / 1.2m style
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s*([kKmM])", t)
+    if m:
+        num = float(m.group(1).replace(",", "."))
+        mult = 1000 if m.group(2).lower() == "k" else 1_000_000
+        return int(num * mult)
+    m2 = re.search(r"(\d[\d\s,\.]*)", t)
+    if not m2:
+        return None
+    digits = re.sub(r"[^\d]", "", m2.group(1))
+    return int(digits) if digits else None
+
+
+def instagram_public_scrape(profile_url: str) -> dict:
+    """
+    Best-effort public Instagram scrape without login.
+    Returns dict: bio (str|None), followers (int|None), posts (int|None)
+    Never raises (returns empty values on failure).
+    """
+    out = {"bio": None, "followers": None, "posts": None}
+    url = (profile_url or "").strip().rstrip("/")
+    if not url:
+        return out
+    if "instagram.com" not in url:
+        return out
+
+    try:
+        r = http_get(url + "/", timeout=20)
+        if r.status_code in (401, 403, 429):
+            return out
+        r.raise_for_status()
+        html_text = r.text or ""
+    except Exception:
+        return out
+
+    # Try meta description first (often contains followers/posts and sometimes bio).
+    desc = None
+    if BeautifulSoup is not None:
+        try:
+            soup = BeautifulSoup(html_text, "html.parser")
+            meta = soup.find("meta", attrs={"name": "description"})
+            if meta and meta.get("content"):
+                desc = meta["content"]
+        except Exception:
+            desc = None
+    if desc is None:
+        m = re.search(r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']', html_text, re.I)
+        if m:
+            desc = html.unescape(m.group(1))
+
+    if desc:
+        # Example: "1,234 Followers, 56 Following, 10 Posts - See Instagram photos and videos from Name (@user) ..."
+        parts = desc.split(" - ", 1)
+        head = parts[0]
+        m_follow = re.search(r"([\d\.,\s\u202f\xa0]+[kKmM]?)\s+Followers", head, re.I)
+        m_posts = re.search(r"([\d\.,\s\u202f\xa0]+[kKmM]?)\s+Posts", head, re.I)
+        if m_follow:
+            out["followers"] = _parse_int_maybe(m_follow.group(1))
+        if m_posts:
+            out["posts"] = _parse_int_maybe(m_posts.group(1))
+        # Bio sometimes appears after the second dash in some locales; best-effort keep tail.
+        if len(parts) > 1:
+            tail = parts[1].strip()
+            if tail and len(tail) < 220:
+                out["bio"] = tail
+
+    return out
 
 
 def wikidata_search_entity(name: str) -> Optional[str]:
@@ -238,6 +374,9 @@ def wikidata_sparql(query: str) -> dict:
 
 
 def wikipedia_find_page_title(search_query: str) -> Optional[str]:
+    key = (search_query or "").strip().lower()
+    if key in _WIKIPEDIA_TITLE_CACHE:
+        return _WIKIPEDIA_TITLE_CACHE[key]
     search_url = (
         "https://en.wikipedia.org/w/api.php?"
         f"action=query&list=search&srsearch={quote_plus(search_query)}&srlimit=1&format=json"
@@ -252,7 +391,9 @@ def wikipedia_find_page_title(search_query: str) -> Optional[str]:
             return None
         return hit[0].get("title")
 
-    return RETRY.run(f"Wikipedia search title {search_query}", _do)
+    title = RETRY.run(f"Wikipedia search title {search_query}", _do)
+    _WIKIPEDIA_TITLE_CACHE[key] = title
+    return title
 
 
 def wikipedia_extract_names_from_page(title: str, limit: int = 60, section_hints: Optional[List[str]] = None) -> List[str]:
@@ -508,7 +649,13 @@ def normalize_instagram_handle(handle_or_url: Optional[str]) -> Optional[str]:
     if "instagram.com/" in s:
         s = s.split("instagram.com/", 1)[1]
     s = s.split("?", 1)[0].split("#", 1)[0].strip("/")
+    # Keep only profile URLs (single path segment). Reject /popular/x, /explore/..., etc.
+    if "/" in s:
+        return None
     if not s:
+        return None
+    blocked = {"p", "reel", "explore", "accounts", "stories", "popular"}
+    if s.lower() in blocked:
         return None
     if s.startswith("@"):
         return s
@@ -626,7 +773,7 @@ class SearchProgressDialog:
 
         self._center()
         self.win.transient(root)
-        self.win.grab_set()
+        # Do not grab: allow moving the main window during search.
 
     def _cancel(self) -> None:
         try:
@@ -678,10 +825,6 @@ class SearchProgressDialog:
         except Exception:
             pass
         try:
-            self.win.grab_release()
-        except Exception:
-            pass
-        try:
             self.win.destroy()
         except Exception:
             pass
@@ -694,7 +837,7 @@ class BusyDialog:
         self.win.resizable(False, False)
         self.win.transient(root)
         self.win.protocol("WM_DELETE_WINDOW", lambda: None)
-        self.win.grab_set()
+        # Do not grab: allow moving the main window during background work.
 
         frm = ttk.Frame(self.win, padding=14)
         frm.pack(fill="both", expand=True)
@@ -724,10 +867,6 @@ class BusyDialog:
     def close(self) -> None:
         try:
             self.bar.stop()
-        except Exception:
-            pass
-        try:
-            self.win.grab_release()
         except Exception:
             pass
         try:
@@ -773,10 +912,54 @@ class AthleteApp(tk.Tk):
         self._search_cancel_requested = False
         self._active_busy_dialog: Optional[BusyDialog] = None
         self._instagram_prompt_done = False
+        self._instagram_public_ok: Optional[bool] = None
+        self._instagram_public_message: str = "Instagram: initialisation…"
+        self._ig_scraper = None
+        self._ig_handle_cache_path = os.path.join(CACHE_DIR, "instagram_handle_cache.json")
+        self._ig_handle_cache: Dict[str, str] = {}
+        self._load_ig_handle_cache()
+        if InstagramScraper is not None:
+            try:
+                cache_path = os.path.join(CACHE_DIR, "instagram_cache.json")
+                self._ig_scraper = InstagramScraper(
+                    cache_path=cache_path,
+                    allow_selenium_fallback=True,
+                    cache_ttl_days=7,
+                    logger_fn=append_log,
+                )
+            except Exception:
+                self._ig_scraper = None
         self._splash_started_at = dt.datetime.now()
         self._splash = SplashScreen(self)
         self._splash.show("Chargement de l'interface…")
         self.after(50, self._finish_startup)
+
+    def _load_ig_handle_cache(self) -> None:
+        try:
+            if os.path.exists(self._ig_handle_cache_path):
+                with open(self._ig_handle_cache_path, "r", encoding="utf-8") as f:
+                    data = json.load(f) or {}
+                    if isinstance(data, dict):
+                        cleaned: Dict[str, str] = {}
+                        for k, v in data.items():
+                            key = str(k).strip().lower()
+                            hv = normalize_instagram_handle(str(v)) if v else None
+                            # Reject bad cached handles like @popular/... or non-profile paths.
+                            if not hv:
+                                continue
+                            if hv.lstrip("@").startswith("popular"):
+                                continue
+                            cleaned[key] = hv
+                        self._ig_handle_cache = cleaned
+        except Exception:
+            self._ig_handle_cache = {}
+
+    def _save_ig_handle_cache(self) -> None:
+        try:
+            with open(self._ig_handle_cache_path, "w", encoding="utf-8") as f:
+                json.dump(self._ig_handle_cache, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
     def _finish_startup(self) -> None:
         self._build_ui()
@@ -798,8 +981,33 @@ class AthleteApp(tk.Tk):
     def _start_background_checks(self) -> None:
         t = threading.Thread(target=self._check_chrome_setup_non_blocking, daemon=True)
         t.start()
+        t2 = threading.Thread(target=self._init_instagram_public_non_blocking, daemon=True)
+        t2.start()
 
-    # Startup Instagram init removed (instaloader not used).
+    def _init_instagram_public_non_blocking(self) -> None:
+        """
+        Initialize "Instagram public" access at startup (no login).
+        This updates the right-side status and allows the user to re-run via button.
+        """
+        try:
+            self.after(0, lambda: self._set_status("Initialisation Instagram (mode public)…"))
+            ok = False
+            if self._ig_scraper is not None:
+                ok = bool(self._ig_scraper.probe())
+            else:
+                # Probe a stable public profile page (legacy lightweight probe)
+                probe = instagram_public_scrape("https://www.instagram.com/instagram")
+                ok = (probe.get("followers") is not None) or (probe.get("posts") is not None) or bool(probe.get("bio"))
+            self._instagram_public_ok = bool(ok)
+            if self._instagram_public_ok:
+                self._instagram_public_message = "Instagram: OK (public)"
+            else:
+                self._instagram_public_message = "Instagram: limité (public)"
+        except Exception:
+            self._instagram_public_ok = False
+            self._instagram_public_message = "Instagram: limité (public)"
+        finally:
+            self.after(0, lambda: self._update_instagram_status(bool(self._instagram_public_ok)))
 
     def _check_chrome_setup_non_blocking(self) -> None:
         webdrv, webdrv_exc, _ = ensure_selenium()
@@ -871,7 +1079,7 @@ class AthleteApp(tk.Tk):
         self.search_btn = ttk.Button(actions_row, text="🔍", width=3, command=self.on_search)
         self.search_btn.grid(row=0, column=0, padx=(0, 8), sticky="w")
 
-        ttk.Button(actions_row, text="Connexion Instagram", command=self.on_connect_instagram).grid(row=0, column=1, padx=4, sticky="w")
+        # Bouton Instagram supprimé: l'init se fait automatiquement au lancement (statut à droite).
         ttk.Button(actions_row, text="Charger CSV", command=self.on_load_csv).grid(row=0, column=2, padx=4, sticky="w")
         ttk.Button(actions_row, text="Exporter en CSV", command=self.on_export_csv).grid(row=0, column=3, padx=4, sticky="w")
         ttk.Button(actions_row, text="Ajouter manuellement", command=self.on_add_manual).grid(row=0, column=4, padx=4, sticky="w")
@@ -990,9 +1198,13 @@ class AthleteApp(tk.Tk):
         ).strip()
 
     def _update_instagram_status(self, connected: bool) -> None:
-        # instaloader removed; keep a stable info indicator.
-        self.ig_status_var.set("Instagram: Web-only (pas de session)")
-        self.ig_status_label.configure(foreground="#2a4b8d")
+        # Public-mode status (no login). `connected` means "public access seems OK".
+        msg = self._instagram_public_message if getattr(self, "_instagram_public_message", None) else "Instagram: public"
+        self.ig_status_var.set(msg)
+        if connected:
+            self.ig_status_label.configure(foreground="#0f766e")  # green
+        else:
+            self.ig_status_label.configure(foreground="#b45309")  # amber
 
     def _get_filters(self) -> Optional[SearchFilters]:
         sport = self.sport_var.get().strip()
@@ -1242,13 +1454,7 @@ class AthleteApp(tk.Tk):
                 append_log(f"Wikidata: rejet {name} (âge {row['Age']} > max {filters.age_max})")
                 continue
 
-            # Optional Wikipedia bio (best effort). Keep logs concise.
-            try:
-                wiki = wikipedia_extract_player_data(name)
-                if wiki.get("bio"):
-                    row["Info en bio"] = wiki["bio"]
-            except Exception as e:
-                append_log(f"Wikipedia bio indisponible ({name}): {e}")
+            # Info en bio: Instagram uniquement (laisser vide si non trouvé).
 
             # Followers/posts via web scraping is best-effort; keep empty if fails.
             rows.append(row)
@@ -1461,6 +1667,10 @@ class AthleteApp(tk.Tk):
                     row["Info en bio"] = player_struct["bio"]
                 if player_struct.get("instagram"):
                     row["Instagram"] = player_struct["instagram"]
+                if player_struct.get("posts") is not None and not row.get("Nombre de posts"):
+                    row["Nombre de posts"] = str(player_struct["posts"])
+                if player_struct.get("followers") is not None and not row.get("Nombre d'abonnés"):
+                    row["Nombre d'abonnés"] = str(player_struct["followers"])
 
                 # Instagram enrichment removed (web-only). Keep nullable.
 
@@ -1494,16 +1704,10 @@ class AthleteApp(tk.Tk):
             "age": None,
             "nationality": None,
             "instagram": normalize_instagram_handle(ig_username) if ig_username else None,
+            "followers": None,
             "posts": None,
             "bio": None,
         }
-        # Wikipedia (best effort)
-        try:
-            wiki = wikipedia_extract_player_data(name)
-            out["bio"] = wiki.get("bio") or out["bio"]
-            # birth_date/nationality not always provided by summary
-        except Exception as e:
-            append_log(f"Wikipedia échoué pour {name}: {e}")
 
         # Wikidata fallback
         try:
@@ -1535,6 +1739,102 @@ class AthleteApp(tk.Tk):
                     out["instagram"] = normalize_instagram_handle(ig)
         except Exception as e:
             append_log(f"Wikidata échoué pour {name}: {e}")
+
+        # If no Instagram handle found via Wikidata, try lightweight DDG lookup (single HTTP query).
+        if not out.get("instagram"):
+            try:
+                key = (name or "").strip().lower()
+                cached_handle = self._ig_handle_cache.get(key)
+                if cached_handle:
+                    valid_cached = normalize_instagram_handle(cached_handle)
+                    if valid_cached and not valid_cached.lstrip("@").startswith("popular"):
+                        out["instagram"] = valid_cached
+                        append_log(f"[IG] {name}: handle cache {valid_cached}")
+                    else:
+                        append_log(f"[IG] {name}: handle cache ignoré (invalide)")
+                        self._ig_handle_cache.pop(key, None)
+                        self._save_ig_handle_cache()
+                else:
+                    # Manual trusted mapping (most reliable when search engines block bots).
+                    manual_handle = PLAYER_IG_HINTS.get(key)
+                    if manual_handle:
+                        manual_norm = normalize_instagram_handle(manual_handle)
+                        if manual_norm:
+                            out["instagram"] = manual_norm
+                            self._ig_handle_cache[key] = manual_norm
+                            self._save_ig_handle_cache()
+                            append_log(f"[IG] {name}: handle manuel {manual_norm}")
+                    if out.get("instagram"):
+                        guessed = out.get("instagram")
+                    else:
+                        guessed = None
+
+                    if not guessed:
+                        append_log(f"[IG] {name}: handle absent, tentative résolution DDG HTTP")
+                        guessed = self._resolve_instagram_handle_http(name)
+                    if (not guessed) and (not IG_FAST_MODE):
+                        append_log(f"[IG] {name}: DDG HTTP vide, tentative résolution Google")
+                        guessed = self._resolve_instagram_handle_google(name, "PSG")
+                    # Keep selenium DDG as last resort only.
+                    if (not guessed) and (not IG_FAST_MODE):
+                        append_log(f"[IG] {name}: Google vide, tentative résolution selenium DDG")
+                        guessed = self._resolve_instagram_handle_selenium(name)
+                    if (not guessed) and IG_FAST_MODE:
+                        append_log(f"[IG] {name}: mode rapide actif, fallback Google/Selenium ignoré")
+                    if guessed:
+                        guessed_norm = normalize_instagram_handle(guessed)
+                        if not guessed_norm or guessed_norm.lstrip("@").startswith("popular"):
+                            append_log(f"[IG] {name}: handle rejeté (invalide) {guessed}")
+                            guessed_norm = None
+                        if guessed_norm:
+                            out["instagram"] = guessed_norm
+                            self._ig_handle_cache[key] = guessed_norm
+                            self._save_ig_handle_cache()
+                            if guessed_norm != out.get("instagram"):
+                                append_log(f"[IG] {name}: handle trouvé {guessed_norm}")
+                        else:
+                            append_log(f"[IG] {name}: handle introuvable")
+                    else:
+                        append_log(f"[IG] {name}: handle introuvable")
+            except Exception:
+                append_log(f"[IG] {name}: erreur résolution handle")
+                pass
+
+        # Instagram public fallback (silent): scrape only when we have a handle/url.
+        try:
+            ig = out.get("instagram")
+            ig_url = None
+            if ig and isinstance(ig, str) and ig.startswith("@"):
+                ig_url = f"https://www.instagram.com/{ig[1:]}"
+            elif isinstance(ig, str) and "instagram.com" in ig:
+                ig_url = ig
+            if ig_url:
+                append_log(f"[IG] {name}: scraping {ig_url}")
+                if self._ig_scraper is not None:
+                    ig_data = self._ig_scraper.get_profile(ig_url.rstrip("/").split("/")[-1])
+                    if ig_data.get("bio"):
+                        out["bio"] = ig_data["bio"]
+                    if ig_data.get("posts") is not None:
+                        out["posts"] = ig_data["posts"]
+                    if ig_data.get("followers") is not None:
+                        out["followers"] = ig_data["followers"]
+                else:
+                    ig_data = instagram_public_scrape(ig_url)
+                    if ig_data.get("bio"):
+                        out["bio"] = ig_data["bio"]
+                    if ig_data.get("posts") is not None:
+                        out["posts"] = ig_data["posts"]
+                    if ig_data.get("followers") is not None:
+                        out["followers"] = ig_data["followers"]
+                append_log(
+                    f"[IG] {name}: résultat bio={'oui' if out.get('bio') else 'non'} "
+                    f"followers={out.get('followers')} posts={out.get('posts')}"
+                )
+            else:
+                append_log(f"[IG] {name}: scraping ignoré (pas d'URL instagram)")
+        except Exception:
+            append_log(f"[IG] {name}: erreur scraping")
+            pass
 
         return out
 
@@ -1805,11 +2105,289 @@ class AthleteApp(tk.Tk):
             uniq.append(u)
         return uniq
 
+    def _extract_instagram_profile_from_search_href(self, href: str) -> Optional[str]:
+        """
+        Normalize Google/DDG result links to direct instagram profile URL.
+        Handles redirect forms like /url?q=https://instagram.com/xxx
+        """
+        raw = (href or "").strip()
+        if not raw:
+            return None
+        # Absolute Google redirect URL
+        try:
+            parsed = urlparse(raw)
+            if parsed.netloc and "google." in parsed.netloc and parsed.path == "/url":
+                qv = parse_qs(parsed.query).get("q", [])
+                if qv:
+                    raw = qv[0]
+                else:
+                    uv = parse_qs(parsed.query).get("url", [])
+                    if uv:
+                        raw = uv[0]
+        except Exception:
+            pass
+        # Relative redirect URL
+        if raw.startswith("/url?"):
+            try:
+                parsed_qs = parse_qs(urlparse(raw).query)
+                q = parsed_qs.get("q", [])
+                u = parsed_qs.get("url", [])
+                if q:
+                    raw = q[0]
+                elif u:
+                    raw = u[0]
+            except Exception:
+                pass
+        raw = unquote(raw)
+        raw = html.unescape(raw)
+        if "instagram.com/" not in raw:
+            return None
+        # keep only profile-like URLs
+        clean = raw.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+        tail = clean.split("/")[-1].lower() if "/" in clean else ""
+        if not tail or tail in ("p", "reel", "explore", "accounts", "stories"):
+            return None
+        return clean
+
+    def _extract_instagram_handles_from_text(self, text: str) -> List[str]:
+        out: List[str] = []
+        if not text:
+            return out
+        # Unescape common escaped URL forms from search engines (e.g. https:\/\/www.instagram.com\/user\/)
+        text_unescaped = text.replace("\\/", "/")
+        # 1) Direct profile URLs
+        for m in re.findall(r"https?://(?:www\.)?instagram\.com/([A-Za-z0-9._]+)/?", text_unescaped):
+            u = (m or "").strip().lower()
+            if not u or u in ("p", "reel", "explore", "accounts", "stories"):
+                continue
+            out.append(f"@{u}")
+        # 2) Visible handle pattern often present in result titles/snippets: "(@username)"
+        for m in re.findall(r"\(@([A-Za-z0-9._]{2,30})\)", text_unescaped):
+            u = (m or "").strip().lower()
+            if not u or u in ("p", "reel", "explore", "accounts", "stories", "popular"):
+                continue
+            out.append(f"@{u}")
+        # 3) Generic @username fallback (lower priority, still useful)
+        for m in re.findall(r"@([A-Za-z0-9._]{2,30})", text_unescaped):
+            u = (m or "").strip().lower()
+            if not u or u in ("p", "reel", "explore", "accounts", "stories", "popular"):
+                continue
+            out.append(f"@{u}")
+        # dedupe preserve order
+        seen = set()
+        uniq = []
+        for h in out:
+            if h in seen:
+                continue
+            seen.add(h)
+            uniq.append(h)
+        return uniq
+
+    def _resolve_instagram_handle_http(self, name: str) -> Optional[str]:
+        """
+        Lightweight DDG lookup to find an Instagram profile URL for a player name.
+        Returns normalized handle like '@username' or None.
+        """
+        q = f'site:instagram.com "{name}" football'
+        url = f"https://duckduckgo.com/html/?q={quote_plus(q)}"
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            ),
+            "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+        }
+        try:
+            append_log(f"[IG] {name}: DDG lookup handle")
+            resp = requests.get(url, headers=headers, timeout=15)
+            if resp.status_code >= 400:
+                append_log(f"[IG] {name}: DDG HTTP {resp.status_code}")
+                return None
+            links = self._extract_instagram_links_from_html(resp.text or "")
+            if not links:
+                append_log(f"[IG] {name}: DDG aucun lien instagram")
+                return None
+
+            name_tokens = [t.lower() for t in re.findall(r"[A-Za-zÀ-ÿ]+", name or "") if len(t) >= 3]
+            best = None
+            best_score = -1
+            for link in links[:12]:
+                handle = normalize_instagram_handle(link)
+                if not handle:
+                    continue
+                u = handle.lstrip("@").lower()
+                # Filter obvious non-profile paths
+                if u in ("p", "reel", "explore", "accounts"):
+                    continue
+                score = 0
+                for t in name_tokens:
+                    if t in u:
+                        score += 2
+                # Prefer shorter clean usernames when score ties.
+                score -= max(0, len(u) - 20) * 0.05
+                if score > best_score:
+                    best = handle
+                    best_score = score
+            if best_score > 0:
+                return best
+            append_log(f"[IG] {name}: DDG liens non pertinents")
+            return None
+        except Exception:
+            append_log(f"[IG] {name}: DDG erreur")
+            return None
+
+    def _resolve_instagram_handle_selenium(self, name: str) -> Optional[str]:
+        webdrv, webdrv_exc, by_cls = ensure_selenium()
+        if webdrv is None or by_cls is None:
+            append_log(f"[IG] {name}: selenium indisponible")
+            return None
+
+    def _resolve_instagram_handle_google(self, name: str, club_hint: str = "") -> Optional[str]:
+        webdrv, webdrv_exc, by_cls = ensure_selenium()
+        if webdrv is None or by_cls is None:
+            append_log(f"[IG] {name}: google selenium indisponible")
+            return None
+        driver = None
+        try:
+            options = webdrv.ChromeOptions()
+            options.add_argument("--headless=new")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--window-size=1400,900")
+            options.add_argument("--disable-blink-features=AutomationControlled")
+            driver = webdrv.Chrome(options=options)
+
+            q = f'"{name}" instagram {club_hint}'.strip()
+            driver.get(f"https://www.google.com/search?q={quote_plus(q)}")
+            self._sleep_with_cancel(1.8)
+
+            # Google results are often redirect links /url?q=...
+            links = driver.find_elements(by_cls.CSS_SELECTOR, "a[href]")
+            if not links:
+                append_log(f"[IG] {name}: google aucun lien instagram")
+                # continue with page_source extraction below
+
+            candidates = []
+            for a in links[:40]:
+                href = (a.get_attribute("href") or "").strip()
+                profile_url = self._extract_instagram_profile_from_search_href(href)
+                if not profile_url:
+                    continue
+                handle = normalize_instagram_handle(profile_url)
+                if not handle:
+                    continue
+                u = handle.lstrip("@").lower()
+                if u in ("p", "reel", "explore", "accounts"):
+                    continue
+                candidates.append(handle)
+
+            # Fallback: parse rendered HTML source directly for instagram URLs.
+            if not candidates:
+                try:
+                    src = driver.page_source or ""
+                    candidates.extend(self._extract_instagram_handles_from_text(src))
+                except Exception:
+                    pass
+
+            if not candidates:
+                append_log(f"[IG] {name}: google liens non exploitables")
+                return None
+
+            name_tokens = [t.lower() for t in re.findall(r"[A-Za-zÀ-ÿ]+", name or "") if len(t) >= 3]
+            club_tokens = [t.lower() for t in re.findall(r"[A-Za-zÀ-ÿ]+", club_hint or "") if len(t) >= 2]
+            best = None
+            best_score = -1.0
+            for h in candidates:
+                u = h.lstrip("@").lower()
+                score = 0.0
+                for t in name_tokens:
+                    if t in u:
+                        score += 2.5
+                for t in club_tokens:
+                    if t in u:
+                        score += 0.5
+                score -= max(0, len(u) - 20) * 0.05
+                if score > best_score:
+                    best_score = score
+                    best = h
+
+            # User preference: in practice first valid link is often correct.
+            # If score is weak but we have candidates, keep first one as pragmatic fallback.
+            if best_score > 0 and best:
+                append_log(f"[IG] {name}: google candidat {best} (score={best_score:.2f})")
+                return best
+            if candidates:
+                append_log(f"[IG] {name}: google score insuffisant, fallback premier lien {candidates[0]}")
+                return candidates[0]
+            append_log(f"[IG] {name}: google score insuffisant")
+            return None
+        except (webdrv_exc, Exception):
+            append_log(f"[IG] {name}: google selenium erreur lookup")
+            return None
+        finally:
+            try:
+                if driver is not None:
+                    driver.quit()
+            except Exception:
+                pass
+        driver = None
+        try:
+            options = webdrv.ChromeOptions()
+            options.add_argument("--headless=new")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--window-size=1400,900")
+            driver = webdrv.Chrome(options=options)
+            q = f'site:instagram.com "{name}" football'
+            driver.get(f"https://duckduckgo.com/?q={quote_plus(q)}")
+            self._sleep_with_cancel(1.5)
+            links = driver.find_elements(by_cls.CSS_SELECTOR, "a[href*='instagram.com/']")
+            candidates = []
+            for a in links[:20]:
+                href = (a.get_attribute("href") or "").strip()
+                handle = normalize_instagram_handle(href)
+                if not handle:
+                    continue
+                user = handle.lstrip("@").lower()
+                if user in ("p", "reel", "explore", "accounts"):
+                    continue
+                candidates.append(handle)
+            if not candidates:
+                append_log(f"[IG] {name}: selenium aucun lien instagram")
+                return None
+            # simple name-token scoring
+            name_tokens = [t.lower() for t in re.findall(r"[A-Za-zÀ-ÿ]+", name or "") if len(t) >= 3]
+            best = None
+            best_score = -1
+            for h in candidates:
+                u = h.lstrip("@").lower()
+                score = sum(2 for t in name_tokens if t in u)
+                score -= max(0, len(u) - 20) * 0.05
+                if score > best_score:
+                    best_score = score
+                    best = h
+            return best if best_score > 0 else None
+        except (webdrv_exc, Exception):
+            append_log(f"[IG] {name}: selenium erreur lookup")
+            return None
+        finally:
+            try:
+                if driver is not None:
+                    driver.quit()
+            except Exception:
+                pass
+
     def on_connect_instagram(self) -> None:
+        append_log("Bouton 'Connexion Instagram' cliqué.")
+        # Re-run public init on demand.
+        t = threading.Thread(target=self._init_instagram_public_non_blocking, daemon=True)
+        t.start()
         messagebox.showinfo(
-            APP_TITLE,
-            "Connexion Instagram directe désactivée.\n\n"
-            "L'application fonctionne en mode Web (Wikidata/Wikipedia + recherche Instagram).",
+            f"{APP_TITLE} - Instagram",
+            "Instagram: mode public (sans connexion).\n\n"
+            "L'application tente automatiquement de récupérer (si possible) :\n"
+            "- bio Instagram\n"
+            "- nombre d'abonnés\n"
+            "- nombre de posts\n\n"
+            "Si Instagram bloque (rate-limit/403/429), la recherche continue sans erreur.",
         )
 
     def on_test_instagram(self) -> None:
@@ -1893,50 +2471,11 @@ class AthleteApp(tk.Tk):
 
         return out
 
-    def _write_html_preview(self, csv_path: str) -> Optional[str]:
-        """
-        Create a styled HTML preview next to CSV (colors/layout), since CSV itself cannot store colors.
-        """
-        try:
-            rows = [self._format_row_for_export(r) for r in self._tree_rows()]
-            if not rows:
-                return None
-            html_path = os.path.splitext(csv_path)[0] + ".html"
-            css = (
-                "body{font-family:Segoe UI,Arial,sans-serif;margin:16px;background:#f6f8fb;color:#1f2937;}"
-                "h1{font-size:18px;margin:0 0 10px 0;color:#0f172a;}"
-                "table{border-collapse:collapse;width:100%;background:#fff;}"
-                "th,td{border:1px solid #dbe3ef;padding:6px 8px;font-size:12px;vertical-align:top;}"
-                "th{background:#1d4ed8;color:#fff;position:sticky;top:0;}"
-                "tr:nth-child(even){background:#f8fbff;}"
-            )
-            with open(html_path, "w", encoding="utf-8") as f:
-                f.write("<!doctype html><html><head><meta charset='utf-8'>")
-                f.write(f"<style>{css}</style></head><body>")
-                f.write(f"<h1>{html.escape(APP_TITLE)} - Export</h1>")
-                f.write("<table><thead><tr>")
-                for col in CSV_COLUMNS:
-                    f.write(f"<th>{html.escape(col)}</th>")
-                f.write("</tr></thead><tbody>")
-                for row in rows:
-                    f.write("<tr>")
-                    for col in CSV_COLUMNS:
-                        f.write(f"<td>{html.escape(str(row.get(col, '') or ''))}</td>")
-                    f.write("</tr>")
-                f.write("</tbody></table></body></html>")
-            return html_path
-        except Exception as e:
-            append_log(f"Prévisualisation HTML échouée: {e}")
-            return None
-
     def _autosave_csv(self, query: str) -> None:
         if not self.current_csv_path:
             self.current_csv_path = generate_search_csv_path(query)
         self._write_csv(self.current_csv_path)
-        html_path = self._write_html_preview(self.current_csv_path)
         self._set_status(f"Auto-sauvegarde: {self.current_csv_path}")
-        if html_path:
-            append_log(f"Aperçu HTML stylisé: {html_path}")
 
     def on_export_csv(self) -> None:
         suggested_name = generate_export_filename(self._current_search_text())
@@ -1950,20 +2489,8 @@ class AthleteApp(tk.Tk):
         if not path:
             return
         self._write_csv(path)
-        html_path = self._write_html_preview(path)
         self.current_csv_path = path
-        # Export JSON alongside CSV
-        try:
-            self._build_final_results_from_table()
-            json_path = os.path.splitext(path)[0] + ".json"
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(self.final_results, f, ensure_ascii=False, indent=2)
-            self._set_status(f"Export JSON: {json_path}")
-        except Exception as e:
-            append_log(f"Export JSON échoué: {e}")
         self._set_status(f"Exporté: {path}")
-        if html_path:
-            self._set_status(f"Aperçu HTML: {html_path}")
         messagebox.showinfo(APP_TITLE, f"CSV exporté:\n{path}")
 
     def _build_final_results_from_table(self) -> None:
@@ -2099,7 +2626,7 @@ class AthleteApp(tk.Tk):
             "Si Instagram limite les recherches:\n"
             "- Réessayez plus tard.\n"
             "- Utilisez un VPN.\n\n"
-            "Support: envoi 100€ a RAFA"
+            "Astuce: Activez les logs pour diagnostiquer une recherche."
         )
         messagebox.showinfo("Aide", text)
 
