@@ -14,7 +14,7 @@ echo [1/4] Installation des dependances...
 "%PYTHON_EXE%" -m pip install -r requirements.txt
 
 echo [2/4] Build (onedir)...
-"%PYTHON_EXE%" -m PyInstaller --noconfirm --onedir --windowed --name SportifsManager app.py
+"%PYTHON_EXE%" -m PyInstaller --noconfirm --onedir --windowed --name SportifsManager --collect-submodules selenium --collect-data selenium app.py
 
 echo [3/4] Preparation du dossier release...
 if not exist release mkdir release
@@ -26,10 +26,11 @@ echo [4/4] Ajout du lanceur...
   echo @echo off
   echo setlocal
   echo cd /d "%%~dp0"
-  echo start "" "SportifsManager.exe"
+  echo start "" "SportifsManager\SportifsManager.exe"
 ) > "release\Lancer_SportifsManager.bat"
 
 echo Build termine.
 echo - Dossier: release\SportifsManager\
 echo - Lanceur: release\Lancer_SportifsManager.bat
+call "release\Lancer_SportifsManager.bat"
 pause

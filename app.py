@@ -24,7 +24,10 @@ except Exception:
     WebDriverException = Exception
     By = None
 
-APP_TITLE = "Sportifs Manager"
+APP_NAME = "Athletes Searcher"
+APP_VERSION = "v01.00.00"
+APP_TITLE = f"{APP_NAME} {APP_VERSION}"
+MIN_SPLASH_MS = 1200
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 BASE_DIR = r"C:/Sportifs"
 DATA_DIR = os.path.join(BASE_DIR, "Data")
@@ -218,20 +221,26 @@ class AthleteApp(tk.Tk):
         self.current_csv_path: Optional[str] = None
         self._search_dialog: Optional[SearchProgressDialog] = None
         self.instagram_session_user = self._load_session_user()
+        self._instagram_prompt_done = False
+        self._splash_started_at = dt.datetime.now()
         self._splash = SplashScreen(self)
         self._splash.show("Chargement de l'interface…")
         self.after(50, self._finish_startup)
 
     def _finish_startup(self) -> None:
-        try:
-            self._build_ui()
-            self._set_status("Initialisation…")
-            self._start_background_checks()
-            self._set_status("Prêt.")
-        finally:
-            if getattr(self, "_splash", None) is not None:
-                self._splash.close()
-            self.deiconify()
+        self._build_ui()
+        self._set_status("Initialisation…")
+        self._start_background_checks()
+        self._set_status("Prêt.")
+
+        elapsed_ms = int((dt.datetime.now() - self._splash_started_at).total_seconds() * 1000)
+        remaining_ms = max(0, MIN_SPLASH_MS - elapsed_ms)
+        self.after(remaining_ms, self._close_startup_splash)
+
+    def _close_startup_splash(self) -> None:
+        if getattr(self, "_splash", None) is not None:
+            self._splash.close()
+        self.deiconify()
 
     def _start_background_checks(self) -> None:
         t = threading.Thread(target=self._check_chrome_setup_non_blocking, daemon=True)
@@ -341,6 +350,8 @@ class AthleteApp(tk.Tk):
     def on_search(self) -> None:
         filters = self._get_filters()
         if not filters:
+            return
+        if not self._ensure_instagram_session_prompt():
             return
         self.search_btn.configure(state="disabled")
         self.progress.configure(value=0, maximum=filters.max_profiles)
@@ -488,6 +499,51 @@ class AthleteApp(tk.Tk):
 
         return results
 
+    def _ensure_instagram_session_prompt(self) -> bool:
+        """Prompt at first search to improve reliability with an IG session."""
+        if self._instagram_prompt_done:
+            return True
+        self._instagram_prompt_done = True
+
+        # If a saved session exists, no need to prompt.
+        if (self.instagram_session_user or "").strip():
+            return True
+
+        should_connect = messagebox.askyesno(
+            APP_TITLE,
+            "Aucune session Instagram détectée.\n\n"
+            "Voulez-vous vous connecter maintenant ?\n"
+            "(recommandé pour éviter les blocages)",
+        )
+        if not should_connect:
+            return True
+
+        use_browser = messagebox.askyesno(
+            APP_TITLE,
+            "Souhaitez-vous ouvrir Instagram dans le navigateur externe avant la connexion ?\n\n"
+            "Cela peut aider (vérification compte/2FA), puis vous reviendrez dans l'application.",
+        )
+        if use_browser:
+            webbrowser.open("https://www.instagram.com/accounts/login/")
+            should_enter_credentials = messagebox.askyesno(
+                APP_TITLE,
+                "Si vous êtes déjà connecté dans le navigateur, vous pouvez continuer sans saisir "
+                "vos identifiants dans l'application.\n\n"
+                "Voulez-vous quand même saisir vos identifiants maintenant ?",
+            )
+            if not should_enter_credentials:
+                self._set_status("Mode navigateur actif (sans session enregistrée dans l'application).")
+                return True
+
+        success = self._connect_instagram_dialog_flow()
+        if not success:
+            messagebox.showwarning(
+                APP_TITLE,
+                "Connexion Instagram non finalisée.\n"
+                "La recherche va continuer, mais peut être limitée.",
+            )
+        return True
+
     def _search_web_fallback(self, filters: SearchFilters) -> List[Dict[str, str]]:
         if webdriver is None or By is None:
             raise RuntimeError(
@@ -591,10 +647,10 @@ class AthleteApp(tk.Tk):
             append_log(f"Session Instagram invalide: {e}")
             return False
 
-    def on_connect_instagram(self) -> None:
+    def _connect_instagram_dialog_flow(self) -> bool:
         if instaloader is None:
             messagebox.showerror(APP_TITLE, "instaloader non installé.")
-            return
+            return False
         username = simpledialog.askstring(
             APP_TITLE,
             "Nom d'utilisateur Instagram:",
@@ -602,10 +658,10 @@ class AthleteApp(tk.Tk):
             parent=self,
         )
         if not username:
-            return
+            return False
         password = simpledialog.askstring(APP_TITLE, "Mot de passe Instagram:", show="*", parent=self)
         if not password:
-            return
+            return False
 
         self._set_status("Connexion Instagram en cours...")
         try:
@@ -623,9 +679,29 @@ class AthleteApp(tk.Tk):
             self._save_session_user(username.strip())
             self._set_status(f"Session Instagram enregistrée: @{username.strip()}")
             messagebox.showinfo(APP_TITLE, "Connexion Instagram réussie. Session sauvegardée.")
+            return True
         except Exception as e:
             append_log(f"Connexion Instagram échouée: {e}")
             messagebox.showerror(APP_TITLE, f"Connexion Instagram échouée:\n{e}")
+            return False
+
+    def on_connect_instagram(self) -> None:
+        use_browser = messagebox.askyesno(
+            APP_TITLE,
+            "Ouvrir la page de connexion Instagram dans votre navigateur ?",
+        )
+        if use_browser:
+            webbrowser.open("https://www.instagram.com/accounts/login/")
+            should_enter_credentials = messagebox.askyesno(
+                APP_TITLE,
+                "Si vous êtes déjà connecté dans le navigateur, vous pouvez éviter la saisie "
+                "des identifiants dans l'application.\n\n"
+                "Voulez-vous saisir vos identifiants maintenant ?",
+            )
+            if not should_enter_credentials:
+                self._set_status("Mode navigateur actif (sans session enregistrée dans l'application).")
+                return
+        self._connect_instagram_dialog_flow()
 
     def on_test_instagram(self) -> None:
         if instaloader is None:
@@ -807,7 +883,7 @@ class AthleteApp(tk.Tk):
             "Si Instagram limite les recherches:\n"
             "- Réessayez plus tard.\n"
             "- Utilisez un VPN.\n\n"
-            "Support: support@sportifs-manager.local"
+            "Support: envoi 100€ a RAFA"
         )
         messagebox.showinfo("Aide", text)
 
