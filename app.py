@@ -48,6 +48,13 @@ _single_instance_socket = None
 DEFAULT_SPORT = "foot"
 DEFAULT_VILLE = "paris"
 DEFAULT_CLUB = "psg"
+CLUB_WIKIDATA_QIDS = {
+    "psg": "Q483020",  # Paris Saint-Germain F.C.
+    "paris sg": "Q483020",
+    "paris-sg": "Q483020",
+    "paris saint-germain": "Q483020",
+    "paris saint-germain f.c.": "Q483020",
+}
 
 CSV_COLUMNS = [
     "Nom",
@@ -248,7 +255,7 @@ def wikipedia_find_page_title(search_query: str) -> Optional[str]:
     return RETRY.run(f"Wikipedia search title {search_query}", _do)
 
 
-def wikipedia_extract_names_from_page(title: str, limit: int = 60) -> List[str]:
+def wikipedia_extract_names_from_page(title: str, limit: int = 60, section_hints: Optional[List[str]] = None) -> List[str]:
     """
     Best-effort extraction of player-like names from an English Wikipedia page.
     Uses BeautifulSoup when available; otherwise falls back to regex.
@@ -264,9 +271,29 @@ def wikipedia_extract_names_from_page(title: str, limit: int = 60) -> List[str]:
     names: List[str] = []
     seen = set()
 
+    def _is_likely_player_name(name: str) -> bool:
+        n = (name or "").strip()
+        if not n:
+            return False
+        lower = n.lower()
+        # Common non-player entities seen in squad tables (clubs, sections, metadata).
+        blocked_tokens = [
+            "fc", "cf", "ac", "sc", "inter", "bayern", "sporting", "eintracht", "saint-germain",
+            "paris", "milan", "frankfurt", "são paulo", "sao paulo", "loan", "captain", "manager",
+            "coach", "league", "cup", "women", "youth", "reserve", "academy",
+        ]
+        if any(tok in lower for tok in blocked_tokens):
+            return False
+        # Player-like: 2-3 words, letters/apostrophes/hyphen/accents.
+        if not re.match(r"^[A-ZÀ-Ý][A-Za-zÀ-ÿ'\-]+(?:\s+[A-ZÀ-Ý][A-Za-zÀ-ÿ'\-]+){1,2}$", n):
+            return False
+        return True
+
     def _add(name: str) -> None:
         n = (name or "").strip()
         if not n:
+            return
+        if not _is_likely_player_name(n):
             return
         key = n.lower()
         if key in seen:
@@ -274,23 +301,74 @@ def wikipedia_extract_names_from_page(title: str, limit: int = 60) -> List[str]:
         seen.add(key)
         names.append(n)
 
+    hints = [h.strip().lower() for h in (section_hints or []) if (h or "").strip()]
     if BeautifulSoup is not None:
         soup = BeautifulSoup(html_text, "html.parser")
-        # Prefer squad/roster tables (often wikitable).
-        tables = soup.select("table.wikitable")
+        # Try to narrow to a specific section (e.g. "Current squad") to avoid historical players/staff.
+        scoped_tables = []
+        if hints:
+            for h in hints:
+                # Wikipedia section ids are often like "Current_squad"
+                sec_id = h.replace(" ", "_")
+                anchor = soup.find(id=re.compile(rf"^{re.escape(sec_id)}$", re.IGNORECASE))
+                if anchor is not None:
+                    # h2/h3 headline container
+                    headline = anchor
+                    for _ in range(3):
+                        if headline and headline.name in ("h2", "h3", "h4"):
+                            break
+                        headline = headline.parent
+                    node = headline
+                    # walk forward until next heading; collect wikitable
+                    for _ in range(60):
+                        if node is None:
+                            break
+                        node = node.find_next_sibling()
+                        if node is None:
+                            break
+                        if node.name in ("h2", "h3", "h4"):
+                            break
+                        if getattr(node, "name", None) == "table" and "wikitable" in (node.get("class") or []):
+                            scoped_tables.append(node)
+                            # usually first table is enough for names
+                            break
+                if scoped_tables:
+                    break
+
+        tables = scoped_tables if scoped_tables else soup.select("table.wikitable")
         for tbl in tables[:6]:
-            for a in tbl.select("a[href^='/wiki/']"):
-                txt = (a.get_text() or "").strip()
-                if not txt:
+            # Prefer extracting from a "Player/Name" column when present.
+            player_col_idx = None
+            header_cells = tbl.select("tr th")
+            for idx, th in enumerate(header_cells[:12]):
+                htxt = (th.get_text(" ", strip=True) or "").lower()
+                if any(k in htxt for k in ("player", "name", "squad")):
+                    player_col_idx = idx
+                    break
+
+            rows = tbl.select("tr")
+            for tr in rows:
+                cells = tr.find_all(["th", "td"])
+                if not cells:
                     continue
-                # Skip obvious non-player links.
-                if ":" in txt or txt.lower() in ("edit", "squad", "france", "paris", "psg"):
-                    continue
-                # Player-like: 2-3 capitalized tokens.
-                if re.match(r"^[A-Z][A-Za-zÀ-ÿ'\-]+(?:\s+[A-Z][A-Za-zÀ-ÿ'\-]+){1,2}$", txt):
+                # First choice: dedicated player column.
+                candidate_links = []
+                if player_col_idx is not None and player_col_idx < len(cells):
+                    candidate_links = cells[player_col_idx].select("a[href^='/wiki/']")
+                # Fallback: first data cell links.
+                if not candidate_links and len(cells) > 1:
+                    candidate_links = cells[1].select("a[href^='/wiki/']")
+                # Last fallback: any link in row.
+                if not candidate_links:
+                    candidate_links = tr.select("a[href^='/wiki/']")
+
+                for a in candidate_links:
+                    txt = (a.get_text() or "").strip()
+                    if not txt or ":" in txt:
+                        continue
                     _add(txt)
-                if len(names) >= limit:
-                    return names
+                    if len(names) >= limit:
+                        return names
     # Fallback regex over page text (less precise).
     for m in re.findall(r"\b[A-Z][A-Za-zÀ-ÿ'\-]+(?:\s+[A-Z][A-Za-zÀ-ÿ'\-]+){1,2}\b", html_text):
         _add(m)
@@ -304,7 +382,9 @@ def wikidata_team_players(team_name: str, limit: int = 30, season_start_year: Op
     Best-effort roster-like list from Wikidata.
     Returns list of dicts: name, birth_date, nationality, instagram.
     """
-    team_qid = wikidata_search_entity(team_name)
+    team_qid = CLUB_WIKIDATA_QIDS.get((team_name or "").strip().lower())
+    if not team_qid:
+        team_qid = wikidata_search_entity(team_name)
     if not team_qid:
         return []
     # Season filter: keep players whose membership has no end date,
@@ -330,16 +410,24 @@ LIMIT {int(limit)}
 """
     data = wikidata_sparql(q)
     out = []
+    seen = set()
     for b in data.get("results", {}).get("bindings", []):
+        name = (b.get("playerLabel", {}).get("value") or "").strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
         out.append(
             {
-                "name": b.get("playerLabel", {}).get("value"),
+                "name": name,
                 "birth_date": (b.get("birth", {}).get("value") or "")[:10] or None,
                 "nationality": b.get("countryLabel", {}).get("value"),
                 "instagram": normalize_instagram_handle(b.get("ig", {}).get("value")),
             }
         )
-    return [x for x in out if x.get("name")]
+    return out
 
 def wikidata_claim_string(entity: dict, pid: str) -> Optional[str]:
     try:
@@ -390,28 +478,26 @@ def wikipedia_extract_player_data(name: str) -> dict:
         # No Wikipedia page found (not an error; just missing).
         return {"birth_date": None, "nationality": None, "bio": None}
 
-    # Use Wikipedia REST summary on the resolved title.
-    url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote_plus(title)}"
+    # Use MediaWiki extracts API on resolved title (more robust than REST summary 404 cases).
+    extract_url = (
+        "https://en.wikipedia.org/w/api.php?"
+        f"action=query&prop=extracts&exintro=1&explaintext=1&redirects=1&titles={quote_plus(title)}&format=json"
+    )
 
     def _do():
-        r = http_get(url)
+        r = http_get(extract_url)
         r.raise_for_status()
         return r.json()
 
-    try:
-        data = RETRY.run(f"Wikipedia summary {title}", _do)
-    except requests.HTTPError as e:
-        try:
-            status = e.response.status_code if e.response is not None else None
-        except Exception:
-            status = None
-        if status == 404:
-            append_log(f"Wikipedia: pas de page summary pour '{title}' (404).")
-            return {"birth_date": None, "nationality": None, "bio": None}
-        raise
     out = {"birth_date": None, "nationality": None, "bio": None}
-    if isinstance(data, dict):
-        out["bio"] = (data.get("extract") or "").strip() or None
+    data = RETRY.run(f"Wikipedia extract {title}", _do)
+    try:
+        pages = ((data or {}).get("query") or {}).get("pages") or {}
+        first_page = next(iter(pages.values())) if pages else {}
+        extract = (first_page or {}).get("extract") or ""
+        out["bio"] = extract.strip() or None
+    except Exception:
+        out["bio"] = None
     return out
 
 
@@ -684,6 +770,7 @@ class AthleteApp(tk.Tk):
         self._search_progress_analyzed = 0
         self._search_progress_retained = 0
         self._search_cancel_event: Optional[threading.Event] = None
+        self._search_cancel_requested = False
         self._active_busy_dialog: Optional[BusyDialog] = None
         self._instagram_prompt_done = False
         self._splash_started_at = dt.datetime.now()
@@ -940,6 +1027,7 @@ class AthleteApp(tk.Tk):
             return
         # New cancel token per search
         self._search_cancel_event = threading.Event()
+        self._search_cancel_requested = False
         self.search_btn.configure(state="disabled")
         self._set_status("Recherche en cours...")
         if self._search_dialog is not None:
@@ -956,7 +1044,9 @@ class AthleteApp(tk.Tk):
     def _cancel_current_search(self) -> None:
         if self._search_cancel_event is not None:
             self._search_cancel_event.set()
-        append_log("Annulation demandée par l'utilisateur.")
+        if not self._search_cancel_requested:
+            append_log("Annulation demandée par l'utilisateur.")
+            self._search_cancel_requested = True
 
     def _raise_if_cancelled(self) -> None:
         if self._search_cancel_event is not None and self._search_cancel_event.is_set():
@@ -1022,23 +1112,45 @@ class AthleteApp(tk.Tk):
                 limit=filters.max_profiles * 3,
                 season_start_year=filters.saison_start_year,
             )
+            append_log(f"Wikidata: {len(players)} joueurs candidats reçus.")
         except Exception as e:
             append_log(f"Wikidata roster échoué: {e}")
             # Fallback when SPARQL is down: try extract names from Wikipedia squad/season pages.
             try:
                 self.after(0, lambda: self._set_status("Fallback: Wikipedia (page effectif/saison)…"))
                 season_text = filters.saison or ""
-                q_parts = [club, "squad", season_text, "season"]
-                search_query = " ".join(x for x in q_parts if x).strip()
-                title = wikipedia_find_page_title(search_query)
+                title = None
+                # Club alias to improve Wikipedia target (psg -> full club name).
+                club_for_wiki = club.strip()
+                if club_for_wiki.lower() in ("psg", "paris sg", "paris-sg"):
+                    club_for_wiki = "Paris Saint-Germain F.C."
+
+                # Prefer an exact season page title search (reduces “historical players” pages).
+                start = filters.saison_start_year
+                if start is not None:
+                    end = start + 1
+                    season_labels = [f"{start}–{end}", f"{start}-{end}", f"{start}–{end} season"]
+                    for lab in season_labels:
+                        title = wikipedia_find_page_title(f"{lab} {club_for_wiki} season")
+                        if title:
+                            break
+
+                if not title:
+                    q_parts = [club_for_wiki, "current squad", season_text]
+                    search_query = " ".join(x for x in q_parts if x).strip()
+                    title = wikipedia_find_page_title(search_query)
                 if not title:
                     # Alternative query more PSG-friendly
-                    title = wikipedia_find_page_title(f"{club} season {season_text}".strip())
+                    title = wikipedia_find_page_title(f"{club_for_wiki} season {season_text}".strip())
                 if not title:
                     append_log("Fallback Wikipedia: aucune page trouvée (titre introuvable).")
                     return []
                 append_log(f"Fallback Wikipedia: page = {title}")
-                names = wikipedia_extract_names_from_page(title, limit=filters.max_profiles * 4)
+                names = wikipedia_extract_names_from_page(
+                    title,
+                    limit=filters.max_profiles * 4,
+                    section_hints=["Current squad", "Squad"],
+                )
                 append_log(f"Fallback Wikipedia: {len(names)} noms extraits.")
                 if not names:
                     return []
@@ -1130,13 +1242,13 @@ class AthleteApp(tk.Tk):
                 append_log(f"Wikidata: rejet {name} (âge {row['Age']} > max {filters.age_max})")
                 continue
 
-            # Optional Wikipedia bio (best effort)
+            # Optional Wikipedia bio (best effort). Keep logs concise.
             try:
                 wiki = wikipedia_extract_player_data(name)
                 if wiki.get("bio"):
                     row["Info en bio"] = wiki["bio"]
-            except Exception:
-                pass
+            except Exception as e:
+                append_log(f"Wikipedia bio indisponible ({name}): {e}")
 
             # Followers/posts via web scraping is best-effort; keep empty if fails.
             rows.append(row)
@@ -1181,11 +1293,6 @@ class AthleteApp(tk.Tk):
         return f"Erreur: {msg}"
 
     def _search_players_then_instagram(self, filters: SearchFilters) -> List[Dict[str, str]]:
-        webdrv, webdrv_exc, by_cls = ensure_selenium()
-        if webdrv is None or by_cls is None:
-            append_log("Recherche web-first: Selenium indisponible, retour vide (fallback possible).")
-            return []
-
         sport = (filters.sport or "").strip()
         club = (filters.club or "").strip()
         ville = (filters.ville or "").strip()
@@ -1196,23 +1303,74 @@ class AthleteApp(tk.Tk):
         if not area:
             area = sport
 
-        # Prioritize roster-like queries for better quality player names.
-        query_candidates = [
-            f"effectif {club} {ville} {sport} 2025 2026",
-            f"liste joueurs {club} {ville} {sport}",
-            f"{club} roster {sport} players",
-            f"effectif {area} {sport}",
-        ]
-
+        # Primary: Wikipedia squad/season page (structured) => names
+        player_names: List[str] = []
         try:
-            options = webdrv.ChromeOptions()
-            options.add_argument("--headless=new")
-            options.add_argument("--disable-gpu")
-            options.add_argument("--window-size=1600,1000")
-            driver = webdrv.Chrome(options=options)
-        except (ModuleNotFoundError, ImportError, webdrv_exc):
-            append_log("Recherche web-first: impossible de démarrer Chrome WebDriver.")
-            return []
+            self.after(
+                0,
+                lambda: self._update_search_dialog(
+                    0, "Recherche joueurs: Wikipedia (effectif/saison)…", analyzed=0, retained=0
+                ),
+            )
+            self._raise_if_cancelled()
+            season_text = (filters.saison or "").strip()
+
+            club_for_wiki = club.strip() or area
+            if club_for_wiki.lower() in ("psg", "paris sg", "paris-sg"):
+                club_for_wiki = "Paris Saint-Germain F.C."
+
+            title = None
+            start = filters.saison_start_year
+            if start is not None:
+                end = start + 1
+                # Try typical Wikipedia season page titles first.
+                for lab in (f"{start}–{end}", f"{start}-{end}"):
+                    title = wikipedia_find_page_title(f"{lab} {club_for_wiki} season")
+                    if title:
+                        break
+            if not title:
+                title = wikipedia_find_page_title(f"{club_for_wiki} current squad {season_text}".strip())
+            if not title:
+                title = wikipedia_find_page_title(f"{club_for_wiki} squad".strip())
+
+            if title:
+                append_log(f"Recherche joueurs Wikipedia: page = {title}")
+                player_names = wikipedia_extract_names_from_page(
+                    title,
+                    limit=filters.max_profiles * 4,
+                    section_hints=["Current squad", "Squad"],
+                )
+                append_log(f"Recherche joueurs Wikipedia: {len(player_names)} noms extraits.")
+        except Exception as e:
+            append_log(f"Recherche joueurs Wikipedia échouée: {e}")
+            player_names = []
+
+        # Secondary: DuckDuckGo via Selenium (last resort) when Wikipedia yields nothing.
+        driver = None
+        by_cls = None
+        webdrv_exc = Exception
+        if not player_names:
+            webdrv, webdrv_exc, by_cls = ensure_selenium()
+            if webdrv is None or by_cls is None:
+                append_log("Recherche joueurs: Selenium indisponible et Wikipedia vide.")
+                return []
+
+            # Prioritize roster-like queries for better quality player names.
+            query_candidates = [
+                f"effectif {club} {ville} {sport} {filters.saison}".strip(),
+                f"liste joueurs {club} {ville} {sport}".strip(),
+                f"{club} roster {sport} players".strip(),
+                f"effectif {area} {sport}".strip(),
+            ]
+            try:
+                options = webdrv.ChromeOptions()
+                options.add_argument("--headless=new")
+                options.add_argument("--disable-gpu")
+                options.add_argument("--window-size=1600,1000")
+                driver = webdrv.Chrome(options=options)
+            except (ModuleNotFoundError, ImportError, webdrv_exc):
+                append_log("Recherche joueurs: impossible de démarrer Chrome WebDriver.")
+                return []
 
         rows: List[Dict[str, str]] = []
         analyzed = 0
@@ -1226,22 +1384,22 @@ class AthleteApp(tk.Tk):
             self.after(
                 0,
                 lambda: self._update_search_dialog(
-                    0, "Recherche web des joueurs…", analyzed=0, retained=0
+                    0, "Analyse de la liste joueurs…", analyzed=0, retained=0
                 ),
             )
-            player_names: List[str] = []
-            for q in query_candidates:
-                self._raise_if_cancelled()
-                append_log(f"Recherche web joueurs: requête = {q}")
-                chunk = self._discover_player_names(driver, by_cls, q, filters.max_profiles * 3)
-                append_log(f"Recherche web joueurs: {len(chunk)} noms détectés sur cette requête")
-                for n in chunk:
-                    if n not in player_names:
-                        player_names.append(n)
-                if len(player_names) >= filters.max_profiles * 2:
-                    break
+            if driver is not None and by_cls is not None and not player_names:
+                for q in query_candidates:
+                    self._raise_if_cancelled()
+                    append_log(f"Fallback web joueurs: requête = {q}")
+                    chunk = self._discover_player_names(driver, by_cls, q, filters.max_profiles * 3)
+                    append_log(f"Fallback web joueurs: {len(chunk)} noms détectés sur cette requête")
+                    for n in chunk:
+                        if n not in player_names:
+                            player_names.append(n)
+                    if len(player_names) >= filters.max_profiles * 2:
+                        break
             if not player_names:
-                append_log("Recherche web joueurs: aucun nom détecté (0).")
+                append_log("Recherche joueurs: aucun nom détecté (0).")
                 return []
 
             total_candidates = min(len(player_names), filters.max_profiles * 2)
@@ -1261,13 +1419,22 @@ class AthleteApp(tk.Tk):
                 self.after(
                     0,
                     lambda i=idx, n=name, a=analyzed, r=len(rows): self._update_search_dialog(
-                        i, f"Recherche Instagram pour {n}…", analyzed=a, retained=r
+                        i, f"Enrichissement: {n}…", analyzed=a, retained=r
                     ),
                 )
-                insta_url = self._find_instagram_profile_for_name(driver, by_cls, name, sport, area)
-                if not insta_url:
-                    append_log(f"Recherche IG web: aucun profil trouvé pour '{name}'")
-                username = insta_url.rstrip("/").split("/")[-1] if insta_url else None
+                insta_url = None
+                username = None
+                # Optional: if Selenium is available, try find instagram page for better link (best-effort).
+                if driver is not None and by_cls is not None:
+                    try:
+                        insta_url = self._find_instagram_profile_for_name(driver, by_cls, name, sport, area)
+                        if not insta_url:
+                            append_log(f"Recherche IG web: aucun profil trouvé pour '{name}'")
+                        username = insta_url.rstrip("/").split("/")[-1] if insta_url else None
+                    except SearchCancelled:
+                        raise
+                    except Exception as e:
+                        append_log(f"Recherche IG web échouée pour '{name}': {e}")
                 row = {c: "" for c in CSV_COLUMNS}
                 nom, prenom = self._split_name(name)
                 row["Nom"] = nom or username
@@ -1279,7 +1446,7 @@ class AthleteApp(tk.Tk):
                 row["Instagram"] = insta_url or ""
                 row["Nombre de points"] = ""
                 row["Niveau Barème"] = ""
-                row["Autres informations"] = "Source: Web (roster/pages) -> Instagram"
+                row["Autres informations"] = "Source: Wikipedia roster" if title else "Source: Web roster"
                 row["Priorité"] = ""
 
                 # Step: Wikipedia -> Wikidata (always continue)
@@ -1313,7 +1480,11 @@ class AthleteApp(tk.Tk):
                 )
             return rows
         finally:
-            driver.quit()
+            try:
+                if driver is not None:
+                    driver.quit()
+            except Exception:
+                pass
 
     def _build_player_struct(self, name: str, ig_username: Optional[str]) -> dict:
         """Build final player structure with Wikipedia -> Wikidata fallback. Never raises."""
@@ -1418,6 +1589,7 @@ class AthleteApp(tk.Tk):
         self._search_progress_analyzed = 0
         self._search_progress_retained = 0
         self._search_cancel_event = None
+        self._search_cancel_requested = False
 
     def _update_search_dialog(self, current: int, message: str, analyzed: int = 0, retained: int = 0) -> None:
         self._search_progress_current = int(current)
@@ -1670,18 +1842,101 @@ class AthleteApp(tk.Tk):
     def _write_csv(self, path: str) -> None:
         ensure_app_folders()
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+            # French-friendly CSV (Excel): semicolon separator.
+            writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS, delimiter=";")
             writer.writeheader()
+            seen = set()
             for row in self._tree_rows():
-                if not row["Age"]:
-                    row["Age"] = calc_age(row.get("Date de naissance", ""))
-                writer.writerow(row)
+                cooked = self._format_row_for_export(row)
+                dedup_key = (
+                    (cooked.get("Nom") or "").strip().lower(),
+                    (cooked.get("Prénom") or "").strip().lower(),
+                    (cooked.get("Date de naissance") or "").strip(),
+                )
+                if dedup_key in seen:
+                    continue
+                seen.add(dedup_key)
+                writer.writerow(cooked)
+
+    def _format_date_fr(self, value: str) -> str:
+        s = (value or "").strip()
+        if not s:
+            return ""
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+            try:
+                return dt.datetime.strptime(s, fmt).strftime("%d/%m/%Y")
+            except ValueError:
+                continue
+        return s
+
+    def _format_age_human(self, age_value: str, birth_date: str) -> str:
+        v = (age_value or "").strip()
+        if v:
+            m = re.search(r"\d+", v)
+            if m:
+                return f"{int(m.group(0))} ans"
+        computed = calc_age(birth_date or "")
+        if computed and computed.isdigit():
+            return f"{int(computed)} ans"
+        return ""
+
+    def _format_row_for_export(self, row: Dict[str, str]) -> Dict[str, str]:
+        out = {c: (row.get(c, "") or "") for c in CSV_COLUMNS}
+        out["Date d'ajout"] = self._format_date_fr(out.get("Date d'ajout", ""))
+        out["Date de naissance"] = self._format_date_fr(out.get("Date de naissance", ""))
+        out["Age"] = self._format_age_human(out.get("Age", ""), out.get("Date de naissance", ""))
+
+        insta = (out.get("Instagram", "") or "").strip()
+        if insta.startswith("http"):
+            handle = normalize_instagram_handle(insta)
+            out["Instagram"] = handle[1:] if handle and handle.startswith("@") else (handle or insta)
+
+        return out
+
+    def _write_html_preview(self, csv_path: str) -> Optional[str]:
+        """
+        Create a styled HTML preview next to CSV (colors/layout), since CSV itself cannot store colors.
+        """
+        try:
+            rows = [self._format_row_for_export(r) for r in self._tree_rows()]
+            if not rows:
+                return None
+            html_path = os.path.splitext(csv_path)[0] + ".html"
+            css = (
+                "body{font-family:Segoe UI,Arial,sans-serif;margin:16px;background:#f6f8fb;color:#1f2937;}"
+                "h1{font-size:18px;margin:0 0 10px 0;color:#0f172a;}"
+                "table{border-collapse:collapse;width:100%;background:#fff;}"
+                "th,td{border:1px solid #dbe3ef;padding:6px 8px;font-size:12px;vertical-align:top;}"
+                "th{background:#1d4ed8;color:#fff;position:sticky;top:0;}"
+                "tr:nth-child(even){background:#f8fbff;}"
+            )
+            with open(html_path, "w", encoding="utf-8") as f:
+                f.write("<!doctype html><html><head><meta charset='utf-8'>")
+                f.write(f"<style>{css}</style></head><body>")
+                f.write(f"<h1>{html.escape(APP_TITLE)} - Export</h1>")
+                f.write("<table><thead><tr>")
+                for col in CSV_COLUMNS:
+                    f.write(f"<th>{html.escape(col)}</th>")
+                f.write("</tr></thead><tbody>")
+                for row in rows:
+                    f.write("<tr>")
+                    for col in CSV_COLUMNS:
+                        f.write(f"<td>{html.escape(str(row.get(col, '') or ''))}</td>")
+                    f.write("</tr>")
+                f.write("</tbody></table></body></html>")
+            return html_path
+        except Exception as e:
+            append_log(f"Prévisualisation HTML échouée: {e}")
+            return None
 
     def _autosave_csv(self, query: str) -> None:
         if not self.current_csv_path:
             self.current_csv_path = generate_search_csv_path(query)
         self._write_csv(self.current_csv_path)
+        html_path = self._write_html_preview(self.current_csv_path)
         self._set_status(f"Auto-sauvegarde: {self.current_csv_path}")
+        if html_path:
+            append_log(f"Aperçu HTML stylisé: {html_path}")
 
     def on_export_csv(self) -> None:
         suggested_name = generate_export_filename(self._current_search_text())
@@ -1695,6 +1950,7 @@ class AthleteApp(tk.Tk):
         if not path:
             return
         self._write_csv(path)
+        html_path = self._write_html_preview(path)
         self.current_csv_path = path
         # Export JSON alongside CSV
         try:
@@ -1706,6 +1962,8 @@ class AthleteApp(tk.Tk):
         except Exception as e:
             append_log(f"Export JSON échoué: {e}")
         self._set_status(f"Exporté: {path}")
+        if html_path:
+            self._set_status(f"Aperçu HTML: {html_path}")
         messagebox.showinfo(APP_TITLE, f"CSV exporté:\n{path}")
 
     def _build_final_results_from_table(self) -> None:
