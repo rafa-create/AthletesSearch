@@ -1,10 +1,10 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
-cd /d "%~dp0"
+cd /d "%~dp0\.."
 
 rem Create a clean delivery folder for the client:
 rem - root: Lancer_AthletesSearcher.bat + app\
-rem - excludes: caches, logs, csv, build artifacts, editor folders
+rem - never deliver: .appdata\, Data\, dev\, root-level *.py, build artifacts, editor folders
 
 set "STAMP=%DATE:~-4%%DATE:~3,2%%DATE:~0,2%_%TIME:~0,2%%TIME:~3,2%%TIME:~6,2%"
 set "STAMP=%STAMP: =0%"
@@ -39,11 +39,17 @@ if not exist "app\app.py" (
 )
 
 echo Copie de app\ ...
-robocopy "%CD%\app" "%OUT_DIR%\app" /E /NFL /NDL /NJH /NJS /NP /XD "__pycache__" ".pytest_cache" ".mypy_cache" ".ruff_cache" /XF "*.pyc" >nul
+robocopy "%CD%\app" "%OUT_DIR%\app" /E /NFL /NDL /NJH /NJS /NP ^
+  /XD "__pycache__" ".pytest_cache" ".mypy_cache" ".ruff_cache" ^
+  /XF "*.pyc" >nul
 if errorlevel 8 goto :copy_fail
 
-rem 3) Do NOT copy runtime / dev artifacts to root (client creates them)
-rem - .appdata\, Data\, *.csv, build/dist/release, dev, .vscode, .venv, etc.
+rem 3) Hard cleanup: never deliver these folders/files
+if exist "%OUT_DIR%\.appdata" rmdir /S /Q "%OUT_DIR%\.appdata" >nul 2>&1
+if exist "%OUT_DIR%\Data" rmdir /S /Q "%OUT_DIR%\Data" >nul 2>&1
+if exist "%OUT_DIR%\dev" rmdir /S /Q "%OUT_DIR%\dev" >nul 2>&1
+del /Q "%OUT_DIR%\*.py" >nul 2>&1
+del /Q "%OUT_DIR%\Creer_Livraison_Client.bat" >nul 2>&1
 
 echo.
 echo OK.

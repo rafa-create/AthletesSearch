@@ -24,6 +24,12 @@ release/
 .appdata/
 .appdata/instagram_cache.json
 .appdata/instagram_handle_cache.json
+
+# Delivery folders created by script
+Livraison_Client_*/
+
+# Legacy root data folder (app now uses .appdata/Data)
+Data/
 .pytest_cache/
 .mypy_cache/
 
