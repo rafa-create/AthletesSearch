@@ -2894,13 +2894,13 @@ class AthleteApp(tk.Tk):
             ui_py = os.path.join(APP_DIR, "update_ui.py")
             if os.path.exists(ui_py):
                 subprocess.Popen([sys.executable, ui_py], cwd=APP_DIR, close_fds=True)
-            # Run updater in its own console so errors stay visible.
-            new_console = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
+            # Run updater without opening a cmd window for client.
+            no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
             subprocess.Popen(
                 ["cmd.exe", "/c", bat],
                 cwd=APP_DIR,
                 close_fds=True,
-                creationflags=new_console,
+                creationflags=no_window,
             )
         except Exception as e:
             messagebox.showerror(APP_TITLE, f"Impossible de lancer la mise à jour:\n{e}")
