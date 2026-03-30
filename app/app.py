@@ -1,6 +1,7 @@
 import csv
 import datetime as dt
 import os
+import shutil
 import threading
 import time
 import traceback
@@ -96,10 +97,35 @@ CSV_COLUMNS = [
     "Priorité",
 ]
 
+# External CSV format expected by clients / example file.
+CSV_EXPORT_COLUMNS = [
+    "Nom",
+    "Prénom",
+    "Date d'ajout",
+    "Sport",
+    "Date de naissance",
+    "Age",
+    "Club",
+    "Ville",
+    "Instagram",
+    "Nombre d'abonnés",
+    "Nombre de post",
+    "Post 3 derniers mois",
+    "Nombre de points",
+    "Niveau Barème",
+    "Info en bio",
+    "Autres informations",
+    "Nationalité",
+    "Priorité",
+]
+EXAMPLE_DIR = os.path.join(ROOT_DIR, "exemple")
+XLSX_TEMPLATE_PATH = os.path.join(EXAMPLE_DIR, "template_sportifs.xlsx")
+
 def ensure_app_folders() -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(LOG_DIR, exist_ok=True)
     os.makedirs(CACHE_DIR, exist_ok=True)
+    os.makedirs(EXAMPLE_DIR, exist_ok=True)
 
 
 def now_str() -> str:
@@ -776,6 +802,50 @@ def generate_export_filename(search_text: str) -> str:
     return f"{base}_{stamp}.csv"
 
 
+def ensure_excel_template() -> Optional[str]:
+    """
+    Create an Excel template near the example CSV if missing.
+    Returns template path when available, else None.
+    """
+    ensure_app_folders()
+    if os.path.exists(XLSX_TEMPLATE_PATH):
+        return XLSX_TEMPLATE_PATH
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment
+    except Exception:
+        return None
+    try:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Sportifs"
+        ws.append(CSV_EXPORT_COLUMNS)
+
+        header_fill = PatternFill(fill_type="solid", fgColor="1F4E78")
+        header_font = Font(color="FFFFFF", bold=True)
+        for idx, col in enumerate(CSV_EXPORT_COLUMNS, start=1):
+            c = ws.cell(row=1, column=idx, value=col)
+            c.fill = header_fill
+            c.font = header_font
+            c.alignment = Alignment(horizontal="center", vertical="center")
+
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = f"A1:{chr(ord('A') + len(CSV_EXPORT_COLUMNS) - 1)}1"
+
+        widths = {
+            "A": 18, "B": 16, "C": 14, "D": 12, "E": 16, "F": 14,
+            "G": 24, "H": 18, "I": 24, "J": 16, "K": 14, "L": 18,
+            "M": 16, "N": 14, "O": 28, "P": 28, "Q": 14, "R": 10,
+        }
+        for col, w in widths.items():
+            ws.column_dimensions[col].width = w
+
+        wb.save(XLSX_TEMPLATE_PATH)
+        return XLSX_TEMPLATE_PATH
+    except Exception:
+        return None
+
+
 def ensure_instaloader():
     # instaloader removed (not in allowed dependencies). Keep function for compatibility.
     return None
@@ -1187,20 +1257,21 @@ class AthleteApp(tk.Tk):
         # Bouton Instagram supprimé: l'init se fait automatiquement au lancement (statut à droite).
         ttk.Button(actions_row, text="Charger CSV", command=self.on_load_csv).grid(row=0, column=2, padx=4, sticky="w")
         ttk.Button(actions_row, text="Exporter en CSV", command=self.on_export_csv).grid(row=0, column=3, padx=4, sticky="w")
-        ttk.Button(actions_row, text="Ajouter manuellement", command=self.on_add_manual).grid(row=0, column=4, padx=4, sticky="w")
-        ttk.Button(actions_row, text="Aide", command=self.on_help).grid(row=0, column=5, padx=4, sticky="w")
+        ttk.Button(actions_row, text="Exporter Excel (template)", command=self.on_export_excel).grid(row=0, column=4, padx=4, sticky="w")
+        ttk.Button(actions_row, text="Ajouter manuellement", command=self.on_add_manual).grid(row=0, column=5, padx=4, sticky="w")
+        ttk.Button(actions_row, text="Aide", command=self.on_help).grid(row=0, column=6, padx=4, sticky="w")
 
         self.toggle_logs_btn = ttk.Button(actions_row, text="Afficher logs", command=self._toggle_logs)
-        self.toggle_logs_btn.grid(row=0, column=6, padx=10, sticky="w")
+        self.toggle_logs_btn.grid(row=0, column=7, padx=10, sticky="w")
         self.ig_mode_check = ttk.Checkbutton(
             actions_row,
             text="Mode IG rapide",
             variable=self._ig_fast_mode_var,
         )
-        self.ig_mode_check.grid(row=0, column=7, padx=6, sticky="w")
+        self.ig_mode_check.grid(row=0, column=8, padx=6, sticky="w")
 
         ttk.Button(actions_row, text="Mise à jour", command=self.on_update_app).grid(
-            row=0, column=8, padx=6, sticky="w"
+            row=0, column=9, padx=6, sticky="w"
         )
 
         # Stabilize form layout so input fields remain visible.
@@ -2865,7 +2936,7 @@ class AthleteApp(tk.Tk):
         ensure_app_folders()
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
             # French-friendly CSV (Excel): semicolon separator.
-            writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS, delimiter=";")
+            writer = csv.DictWriter(f, fieldnames=CSV_EXPORT_COLUMNS, delimiter=";")
             writer.writeheader()
             seen = set()
             for row in self._tree_rows():
@@ -2893,20 +2964,60 @@ class AthleteApp(tk.Tk):
 
     def _format_age_human(self, age_value: str, birth_date: str) -> str:
         v = (age_value or "").strip()
+        if birth_date:
+            for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+                try:
+                    born = dt.datetime.strptime((birth_date or "").strip(), fmt).date()
+                    today = dt.date.today()
+                    years = today.year - born.year
+                    months = today.month - born.month
+                    if today.day < born.day:
+                        months -= 1
+                    if months < 0:
+                        years -= 1
+                        months += 12
+                    if years >= 0 and months >= 0:
+                        return f"{years} ans, {months} mois"
+                except ValueError:
+                    continue
         if v:
             m = re.search(r"\d+", v)
             if m:
                 return f"{int(m.group(0))} ans"
-        computed = calc_age(birth_date or "")
-        if computed and computed.isdigit():
-            return f"{int(computed)} ans"
         return ""
 
     def _format_row_for_export(self, row: Dict[str, str]) -> Dict[str, str]:
-        out = {c: (row.get(c, "") or "") for c in CSV_COLUMNS}
+        src = {c: (row.get(c, "") or "") for c in CSV_COLUMNS}
+        out = {c: "" for c in CSV_EXPORT_COLUMNS}
+
+        # 1:1 shared columns
+        for k in (
+            "Nom",
+            "Prénom",
+            "Date d'ajout",
+            "Sport",
+            "Date de naissance",
+            "Age",
+            "Club",
+            "Ville",
+            "Instagram",
+            "Nombre d'abonnés",
+            "Nombre de points",
+            "Niveau Barème",
+            "Info en bio",
+            "Autres informations",
+            "Nationalité",
+            "Priorité",
+        ):
+            out[k] = src.get(k, "")
+
+        # Header differences expected by client CSV.
+        out["Nombre de post"] = src.get("Nombre de posts", "")
+        out["Post 3 derniers mois"] = src.get("Posts 3 derniers mois", "")
+
         out["Date d'ajout"] = self._format_date_fr(out.get("Date d'ajout", ""))
         out["Date de naissance"] = self._format_date_fr(out.get("Date de naissance", ""))
-        out["Age"] = self._format_age_human(out.get("Age", ""), out.get("Date de naissance", ""))
+        out["Age"] = self._format_age_human(src.get("Age", ""), out.get("Date de naissance", ""))
 
         insta = (out.get("Instagram", "") or "").strip()
         if insta.startswith("http"):
@@ -2936,6 +3047,55 @@ class AthleteApp(tk.Tk):
         self.current_csv_path = path
         self._set_status(f"Exporté: {path}")
         messagebox.showinfo(APP_TITLE, f"CSV exporté:\n{path}")
+
+    def _write_excel_from_template(self, path: str) -> None:
+        template = ensure_excel_template()
+        if not template:
+            raise RuntimeError("Template Excel indisponible (module openpyxl manquant).")
+        shutil.copy2(template, path)
+        try:
+            from openpyxl import load_workbook
+        except Exception as e:
+            raise RuntimeError(f"openpyxl indisponible: {e}") from e
+
+        wb = load_workbook(path)
+        ws = wb.active
+        if ws.max_row >= 2:
+            ws.delete_rows(2, ws.max_row - 1)
+
+        seen = set()
+        for row in self._tree_rows():
+            cooked = self._format_row_for_export(row)
+            dedup_key = (
+                (cooked.get("Nom") or "").strip().lower(),
+                (cooked.get("Prénom") or "").strip().lower(),
+                (cooked.get("Date de naissance") or "").strip(),
+            )
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+            ws.append([cooked.get(c, "") for c in CSV_EXPORT_COLUMNS])
+
+        wb.save(path)
+
+    def on_export_excel(self) -> None:
+        suggested_name = generate_export_filename(self._current_search_text()).replace(".csv", ".xlsx")
+        path = filedialog.asksaveasfilename(
+            title="Exporter en Excel (template)",
+            defaultextension=".xlsx",
+            filetypes=[("Excel", "*.xlsx")],
+            initialfile=suggested_name,
+            initialdir=ROOT_DIR,
+        )
+        if not path:
+            return
+        try:
+            self._write_excel_from_template(path)
+        except Exception as e:
+            messagebox.showerror(APP_TITLE, f"Impossible d'exporter en Excel:\n{e}")
+            return
+        self._set_status(f"Exporté (Excel): {path}")
+        messagebox.showinfo(APP_TITLE, f"Excel exporté:\n{path}")
 
     def _build_final_results_from_table(self) -> None:
         """Build final JSON-friendly structure from current table. Never raises."""

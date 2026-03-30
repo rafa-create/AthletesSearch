@@ -8,3 +8,4 @@ fake-useragent
 tenacity
 rich
 loguru
+openpyxl
