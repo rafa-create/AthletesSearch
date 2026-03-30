@@ -6,6 +6,7 @@ import threading
 import time
 import traceback
 import tkinter as tk
+import tkinter.font as tkfont
 import socket
 import re
 import html
@@ -1355,11 +1356,11 @@ class AthleteApp(tk.Tk):
         table_wrap.rowconfigure(0, weight=1)
         table_wrap.columnconfigure(0, weight=1)
 
+        heading_font = tkfont.nametofont("TkHeadingFont")
         for col in CSV_COLUMNS:
             self.tree.heading(col, text=col)
-            width = 140
-            if col in ("Autres informations", "Info en bio", "Instagram"):
-                width = 220
+            # Size columns from their header text length for a cleaner default layout.
+            width = max(90, heading_font.measure(col) + 28)
             self.tree.column(col, width=width, anchor="w")
 
         self.tree.bind("<Double-1>", self._edit_cell)
