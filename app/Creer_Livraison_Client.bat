@@ -48,7 +48,6 @@ rem 3) Hard cleanup: never deliver these folders/files
 if exist "%OUT_DIR%\.appdata" rmdir /S /Q "%OUT_DIR%\.appdata" >nul 2>&1
 if exist "%OUT_DIR%\Data" rmdir /S /Q "%OUT_DIR%\Data" >nul 2>&1
 if exist "%OUT_DIR%\dev" rmdir /S /Q "%OUT_DIR%\dev" >nul 2>&1
-if exist "%OUT_DIR%\exemple" rmdir /S /Q "%OUT_DIR%\exemple" >nul 2>&1
 del /Q "%OUT_DIR%\*.py" >nul 2>&1
 del /Q "%OUT_DIR%\Creer_Livraison_Client.bat" >nul 2>&1
 

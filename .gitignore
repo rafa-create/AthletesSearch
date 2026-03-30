@@ -24,8 +24,8 @@ release/
 .appdata/
 .appdata/instagram_cache.json
 .appdata/instagram_handle_cache.json
-!exemple/
-!exemple/sportifs_exemple.csv
+!app/exemple/
+!app/exemple/sportifs_exemple.csv
 
 # Delivery folders created by script
 Livraison_Client_*/
