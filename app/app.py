@@ -51,10 +51,11 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 # Root delivery folder (launcher sets ATHLETES_ROOT so CSV/logs go to root).
 # Fallback: use parent of ./app when running from sources directly.
 ROOT_DIR = os.path.abspath(os.getenv("ATHLETES_ROOT") or os.path.join(APP_DIR, os.pardir))
-DATA_DIR = os.path.join(ROOT_DIR, "Data")
 # Runtime cache/logs at root (keeps delivery/app folder clean)
 CACHE_DIR = os.path.join(ROOT_DIR, ".appdata")
 LOG_DIR = os.path.join(CACHE_DIR, "logs")
+# Internal app data under .appdata to avoid root pollution.
+DATA_DIR = os.path.join(CACHE_DIR, "Data")
 _single_instance_socket = None
 # Instagram login removed (web-only)
 DEFAULT_SPORT = "foot"

@@ -71,8 +71,13 @@ echo Source: %SRC_DIR%>>"%LOG_FILE%"
 echo [3/5] Mise a jour des fichiers...>>"%LOG_FILE%"
 echo [3/5] Mise a jour des fichiers...
 
-rem robocopy: on ne bloque pas le script si ça échoue (on relance quand même l’app).
-robocopy "%SRC_DIR%" "%ROOT_DIR%" /E /NFL /NDL /NJH /NJS /NP /XD ".git" ".buildvenv" ".appdata" "Data" "release" "__pycache__" "build" "dist" "exemple" ".vscode" ".venv" "test" /XF "*.pyc" "build_onedir.bat" "LaunchApp.bat" "README.md" "GUIDE_1_PAGE.md" "*.spec" "requirements.txt" ".gitignore" >nul 2>&1
+rem Copy only app folder to avoid polluting delivery root.
+robocopy "%SRC_DIR%\app" "%ROOT_DIR%\app" /E /NFL /NDL /NJH /NJS /NP /XD "__pycache__" /XF "*.pyc" >nul 2>&1
+
+rem Keep root launcher in sync if present in source zip.
+if exist "%SRC_DIR%\Lancer_AthletesSearcher.bat" (
+  copy /Y "%SRC_DIR%\Lancer_AthletesSearcher.bat" "%ROOT_DIR%\" >nul 2>&1
+)
 
 echo [4/5] Mise a jour dependances (si venv present)...>>"%LOG_FILE%"
 
