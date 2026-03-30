@@ -1,6 +1,6 @@
 @echo off
 if /I not "%~1"=="hidden" (
-  mshta vbscript:CreateObject("WScript.Shell").Run("""%~f0"" hidden",0)(window.close)
+  powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "Start-Process -WindowStyle Hidden -FilePath '%~f0' -ArgumentList 'hidden'"
   exit /b
 )
 

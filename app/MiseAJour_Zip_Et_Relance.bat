@@ -5,7 +5,7 @@ cd /d "%~dp0"
 rem Delivery root = parent folder of ./app (normalize path to avoid '..' quirks)
 for %%I in ("%CD%\..") do set "ROOT_DIR=%%~fI"
 
-set "LOG_DIR=%ROOT_DIR%\.appdata\logs"
+set "LOG_DIR=%ROOT_DIR%\app\.appdata\logs"
 if not exist "%LOG_DIR%" mkdir "%LOG_DIR%" >nul 2>&1
 set "LOG_FILE=%LOG_DIR%\update.log"
 

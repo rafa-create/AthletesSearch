@@ -7,8 +7,7 @@ from tkinter import ttk
 
 def main() -> int:
     app_dir = os.path.dirname(os.path.abspath(__file__))
-    root_dir = os.path.abspath(os.getenv("ATHLETES_ROOT") or os.path.join(app_dir, os.pardir))
-    log_path = os.path.join(root_dir, ".appdata", "logs", "update.log")
+    log_path = os.path.join(app_dir, ".appdata", "logs", "update.log")
 
     root = tk.Tk()
     root.title("Mise à jour Athletes Searcher")

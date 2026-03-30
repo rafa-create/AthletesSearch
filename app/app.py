@@ -52,8 +52,8 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 # Root delivery folder (launcher sets ATHLETES_ROOT so CSV/logs go to root).
 # Fallback: use parent of ./app when running from sources directly.
 ROOT_DIR = os.path.abspath(os.getenv("ATHLETES_ROOT") or os.path.join(APP_DIR, os.pardir))
-# Runtime cache/logs at root (keeps delivery/app folder clean)
-CACHE_DIR = os.path.join(ROOT_DIR, ".appdata")
+# Runtime cache/logs inside app folder (keeps delivery root clean)
+CACHE_DIR = os.path.join(APP_DIR, ".appdata")
 LOG_DIR = os.path.join(CACHE_DIR, "logs")
 # Internal app data under .appdata to avoid root pollution.
 DATA_DIR = os.path.join(CACHE_DIR, "Data")
@@ -118,7 +118,7 @@ CSV_EXPORT_COLUMNS = [
     "Nationalité",
     "Priorité",
 ]
-EXAMPLE_DIR = os.path.join(ROOT_DIR, "exemple")
+EXAMPLE_DIR = os.path.join(APP_DIR, "exemple")
 XLSX_TEMPLATE_PATH = os.path.join(EXAMPLE_DIR, "template_sportifs.xlsx")
 
 def ensure_app_folders() -> None:
