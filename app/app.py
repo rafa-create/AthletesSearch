@@ -3158,10 +3158,45 @@ class AthleteApp(tk.Tk):
     def _load_csv(self, path: str) -> None:
         for iid in self.tree.get_children():
             self.tree.delete(iid)
+        def _norm_col(s: str) -> str:
+            try:
+                import unicodedata
+
+                s2 = unicodedata.normalize("NFKD", str(s or "")).encode("ascii", "ignore").decode("ascii")
+            except Exception:
+                s2 = str(s or "")
+            s2 = s2.strip().lower()
+            s2 = s2.replace("'", "").replace('"', "")
+            s2 = s2.replace(" ", "").replace("-", "").replace("_", "")
+            return s2
+
+        def _get_cell(row: dict, col: str) -> str:
+            if not row:
+                return ""
+            # Fast path: exact match
+            v = row.get(col)
+            if v is not None and v != "":
+                return v
+            # Robust path: normalized header matching + common variants
+            norm_row = {_norm_col(k): k for k in row.keys()}
+            wants = {_norm_col(col)}
+            # tolerate singular/plural for "post(s)"
+            wants.add(_norm_col(col.replace("posts", "post")))
+            wants.add(_norm_col(col.replace("post", "posts")))
+            for w in wants:
+                k = norm_row.get(w)
+                if k is not None:
+                    return row.get(k, "") or ""
+            return ""
+
         with open(path, "r", newline="", encoding="utf-8-sig") as f:
-            reader = csv.DictReader(f)
+            # Detect delimiter from header line (legacy exports use ';' on FR locale)
+            head = f.readline()
+            delim = ";" if head.count(";") >= head.count(",") else ","
+            f.seek(0)
+            reader = csv.DictReader(f, delimiter=delim)
             for row in reader:
-                values = [row.get(col, "") for col in CSV_COLUMNS]
+                values = [_get_cell(row, col) for col in CSV_COLUMNS]
                 self.tree.insert("", "end", values=values)
 
     def on_load_csv(self) -> None:
