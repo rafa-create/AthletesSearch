@@ -75,6 +75,27 @@ def _resource_path(rel: str) -> str:
     base = getattr(sys, "_MEIPASS", APP_DIR)
     return os.path.join(base, rel)
 
+
+def _macos_updater_script_path() -> Optional[str]:
+    """Locate MiseAJour_macOS_Et_Relance.sh inside a PyInstaller .app or dev tree."""
+    candidates = [
+        _resource_path("MiseAJour_macOS_Et_Relance.sh"),
+        os.path.join(APP_DIR, "MiseAJour_macOS_Et_Relance.sh"),
+        os.path.join(os.path.dirname(os.path.abspath(sys.executable or "")), "MiseAJour_macOS_Et_Relance.sh"),
+        os.path.normpath(
+            os.path.join(os.path.dirname(os.path.abspath(sys.executable or "")), "..", "Resources", "MiseAJour_macOS_Et_Relance.sh")
+        ),
+    ]
+    for c in candidates:
+        try:
+            p = os.path.normpath(os.path.abspath(c))
+            if os.path.isfile(p):
+                return p
+        except Exception:
+            continue
+    return None
+
+
 # Instagram login removed (web-only)
 DEFAULT_SPORT = "foot"
 DEFAULT_VILLE = "paris"
@@ -2960,9 +2981,14 @@ class AthleteApp(tk.Tk):
         is_macos = sys.platform == "darwin"
         is_windows = os.name == "nt"
         if is_macos:
-            updater_in_bundle = _resource_path("MiseAJour_macOS_Et_Relance.sh")
-            if not os.path.exists(updater_in_bundle):
-                messagebox.showerror(APP_TITLE, f"Script de mise à jour macOS introuvable:\n{updater}")
+            updater_in_bundle = _macos_updater_script_path()
+            if not updater_in_bundle:
+                messagebox.showerror(
+                    APP_TITLE,
+                    "Script de mise à jour macOS introuvable dans l'application.\n"
+                    "Réinstallez depuis la dernière release GitHub, ou reconstruisez le .app "
+                    "avec PyInstaller (fichier MiseAJour_macOS_Et_Relance.sh embarqué).",
+                )
                 return
         else:
             bat = os.path.join(APP_DIR, "MiseAJour_Zip_Et_Relance.bat")
@@ -2977,10 +3003,19 @@ class AthleteApp(tk.Tk):
         try:
             # Persist currently opened CSV so the relaunched app restores it.
             self._save_pending_csv_for_update()
-            # Spawn an updater UI that survives closing the app.
+            # Spawn an updater UI that survives closing the app (if shipped next to app.py / in bundle).
             ui_py = os.path.join(APP_DIR, "update_ui.py")
+            if not os.path.exists(ui_py) and _is_frozen():
+                alt = _resource_path("update_ui.py")
+                if os.path.isfile(alt):
+                    ui_py = alt
             if os.path.exists(ui_py):
-                subprocess.Popen([sys.executable, ui_py], cwd=APP_DIR, close_fds=True)
+                subprocess.Popen(
+                    [sys.executable, ui_py],
+                    cwd=os.path.dirname(ui_py) or APP_DIR,
+                    close_fds=True,
+                    stdin=subprocess.DEVNULL,
+                )
             if is_macos:
                 app_bundle = self._find_macos_app_bundle_path()
                 if not app_bundle:
@@ -3000,8 +3035,10 @@ class AthleteApp(tk.Tk):
                     pass
                 subprocess.Popen(
                     ["/bin/bash", updater_tmp, app_bundle],
-                    cwd=APP_DIR,
+                    cwd=tmp_dir,
                     close_fds=True,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
                 )
             elif is_windows:
                 # Run updater without opening a cmd window for client.
@@ -3029,12 +3066,18 @@ class AthleteApp(tk.Tk):
         """
         When packaged as a macOS .app (e.g. PyInstaller), sys.executable typically looks like:
         /.../Athletes Searcher.app/Contents/MacOS/Athletes Searcher
-        We climb up until we find a path ending with .app.
+        Resolve the .app bundle path (any depth under Contents/MacOS/...).
         """
         try:
             exe = os.path.abspath(sys.executable or "")
+            if not exe:
+                return None
+            parts = exe.split(os.sep)
+            for i, seg in enumerate(parts):
+                if seg.lower().endswith(".app"):
+                    return os.sep.join(parts[: i + 1])
             p = exe
-            for _ in range(10):
+            for _ in range(14):
                 if p.lower().endswith(".app") and os.path.isdir(p):
                     return p
                 p2 = os.path.dirname(p)

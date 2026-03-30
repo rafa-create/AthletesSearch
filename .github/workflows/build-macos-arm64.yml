@@ -37,6 +37,7 @@ jobs:
             --name "Athletes Searcher" \
             --add-data "app/exemple:sportifs_exemple" \
             --add-data "app/MiseAJour_macOS_Et_Relance.sh:." \
+            --add-data "app/update_ui.py:." \
             app/app.py
 
       - name: Zip .app
