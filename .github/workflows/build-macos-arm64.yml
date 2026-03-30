@@ -1,7 +1,14 @@
 name: build-macos-arm64
 
+# - Chaque push sur main → build + Release GitHub avec un tag auto (v0.0.<run_number>), sans tag manuel.
+# - Push d'un tag v* (ex. v1.2.0) → build + Release sur ce tag (version “officielle”).
+# - Déclenchement manuel possible.
 on:
   push:
+    branches:
+      - main
+      # Branche de dev courante du dépôt (adapter si besoin)
+      - v01.00.00
     tags:
       - "v*"
   workflow_dispatch: {}
@@ -10,13 +17,25 @@ jobs:
   build:
     runs-on: macos-14
     env:
-      # GitHub recommendation for upcoming Node 20 deprecation in JS actions.
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     permissions:
       contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Déterminer le tag de release
+        id: meta
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+            echo "name=Athletes Searcher ${TAG} (macOS arm64)" >> "$GITHUB_OUTPUT"
+          else
+            TAG="v0.0.${GITHUB_RUN_NUMBER}"
+            echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+            echo "name=Athletes Searcher ${TAG} — build auto (main)" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -48,6 +67,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.name }}
           files: AthletesSearcher-macOS-arm64.zip
           generate_release_notes: true
-
+          prerelease: false
