@@ -9,6 +9,9 @@ on:
 jobs:
   build:
     runs-on: macos-14
+    env:
+      # GitHub recommendation for upcoming Node 20 deprecation in JS actions.
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     permissions:
       contents: write
     steps:
