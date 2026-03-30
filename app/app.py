@@ -1258,20 +1258,23 @@ class AthleteApp(tk.Tk):
         ttk.Button(actions_row, text="Charger CSV", command=self.on_load_csv).grid(row=0, column=2, padx=4, sticky="w")
         ttk.Button(actions_row, text="Exporter en CSV", command=self.on_export_csv).grid(row=0, column=3, padx=4, sticky="w")
         ttk.Button(actions_row, text="Exporter Excel (template)", command=self.on_export_excel).grid(row=0, column=4, padx=4, sticky="w")
-        ttk.Button(actions_row, text="Ajouter manuellement", command=self.on_add_manual).grid(row=0, column=5, padx=4, sticky="w")
-        ttk.Button(actions_row, text="Aide", command=self.on_help).grid(row=0, column=6, padx=4, sticky="w")
+        ttk.Button(actions_row, text="Ajouter ligne", command=self.on_add_manual).grid(row=0, column=5, padx=4, sticky="w")
+        ttk.Button(actions_row, text="Supprimer ligne(s)", command=self.on_delete_selected_rows).grid(
+            row=0, column=6, padx=4, sticky="w"
+        )
+        ttk.Button(actions_row, text="Aide", command=self.on_help).grid(row=0, column=7, padx=4, sticky="w")
 
         self.toggle_logs_btn = ttk.Button(actions_row, text="Afficher logs", command=self._toggle_logs)
-        self.toggle_logs_btn.grid(row=0, column=7, padx=10, sticky="w")
+        self.toggle_logs_btn.grid(row=0, column=8, padx=10, sticky="w")
         self.ig_mode_check = ttk.Checkbutton(
             actions_row,
             text="Mode IG rapide",
             variable=self._ig_fast_mode_var,
         )
-        self.ig_mode_check.grid(row=0, column=8, padx=6, sticky="w")
+        self.ig_mode_check.grid(row=0, column=9, padx=6, sticky="w")
 
         ttk.Button(actions_row, text="Mise à jour", command=self.on_update_app).grid(
-            row=0, column=9, padx=6, sticky="w"
+            row=0, column=10, padx=6, sticky="w"
         )
 
         # Stabilize form layout so input fields remain visible.
@@ -1328,6 +1331,7 @@ class AthleteApp(tk.Tk):
 
         self.tree.bind("<Double-1>", self._edit_cell)
         self.tree.bind("<ButtonRelease-1>", self._maybe_open_instagram)
+        self.tree.bind("<Delete>", lambda _e: self.on_delete_selected_rows())
 
     def _toggle_logs(self) -> None:
         self.logs_visible = not self.logs_visible
@@ -3233,10 +3237,31 @@ class AthleteApp(tk.Tk):
             if not row["Age"]:
                 row["Age"] = calc_age(row.get("Date de naissance", ""))
             self.tree.insert("", "end", values=[row.get(c, "") for c in CSV_COLUMNS])
-            self._autosave_csv(self._current_search_text() or "manuel")
+            self._persist_table_changes(status="Ligne ajoutée.")
             win.destroy()
 
         ttk.Button(frame, text="Ajouter", command=save_manual).grid(row=len(CSV_COLUMNS) + 1, column=1, sticky="e", pady=10)
+
+    def _persist_table_changes(self, status: Optional[str] = None) -> None:
+        self._autosave_csv(self._current_search_text() or "manuel")
+        self._build_final_results_from_table()
+        if status:
+            self._set_status(status)
+
+    def on_delete_selected_rows(self) -> None:
+        selected = list(self.tree.selection())
+        if not selected:
+            messagebox.showinfo(APP_TITLE, "Sélectionnez au moins une ligne à supprimer.")
+            return
+        count = len(selected)
+        if not messagebox.askyesno(APP_TITLE, f"Supprimer {count} ligne(s) sélectionnée(s) ?"):
+            return
+        for iid in selected:
+            try:
+                self.tree.delete(iid)
+            except Exception:
+                pass
+        self._persist_table_changes(status=f"{count} ligne(s) supprimée(s).")
 
     def _edit_cell(self, event: tk.Event) -> None:
         region = self.tree.identify("region", event.x, event.y)
@@ -3260,6 +3285,7 @@ class AthleteApp(tk.Tk):
             values[col_idx] = entry.get()
             self.tree.item(row_id, values=values)
             entry.destroy()
+            self._persist_table_changes(status="Ligne modifiée.")
 
         entry.bind("<Return>", save_edit)
         entry.bind("<FocusOut>", save_edit)
