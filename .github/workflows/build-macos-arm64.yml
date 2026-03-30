@@ -1,5 +1,10 @@
 name: build-macos-arm64
 
+# Node 24 sur les runners (remplace l’ancien runtime Node 20 des actions JS).
+# Voir https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 # - Chaque push sur main → build + Release GitHub avec un tag auto (v0.0.<run_number>), sans tag manuel.
 # - Push d'un tag v* (ex. v1.2.0) → build + Release sur ce tag (version “officielle”).
 # - Déclenchement manuel possible.
@@ -16,13 +21,11 @@ on:
 jobs:
   build:
     runs-on: macos-14
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     permissions:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Déterminer le tag de release
         id: meta
@@ -38,7 +41,7 @@ jobs:
           fi
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
@@ -65,7 +68,7 @@ jobs:
           ditto -c -k --sequesterRsrc --keepParent "Athletes Searcher.app" "../AthletesSearcher-macOS-arm64.zip"
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v2.6.1
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
           name: ${{ steps.meta.outputs.name }}
