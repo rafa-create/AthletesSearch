@@ -2170,7 +2170,16 @@ class AthleteApp(tk.Tk):
         self._search_progress_analyzed = int(analyzed)
         self._search_progress_retained = int(retained)
         if self._search_dialog is not None:
-            self._search_dialog.update(current, message, analyzed=analyzed, retained=retained)
+            # Throttle UI refreshes to avoid a too-fast / flickery progress dialog.
+            # We still keep internal counters exact, but only repaint periodically.
+            now_ts = time.time()
+            last_ts = float(getattr(self, "_search_dialog_last_update_ts", 0.0) or 0.0)
+            min_interval = float(getattr(self, "_search_dialog_min_update_interval_s", 0.25) or 0.25)
+            total = int(getattr(self._search_dialog, "total", 0) or 0)
+            force = current <= 0 or (total > 0 and current >= total)
+            if force or (now_ts - last_ts) >= min_interval:
+                setattr(self, "_search_dialog_last_update_ts", now_ts)
+                self._search_dialog.update(current, message, analyzed=analyzed, retained=retained)
 
     # Direct Instagram search removed (instaloader not used). Web/Wikidata only.
 
