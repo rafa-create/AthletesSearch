@@ -63,10 +63,7 @@ CLUB_WIKIDATA_QIDS = {
     "paris saint-germain": "Q483020",
     "paris saint-germain f.c.": "Q483020",
 }
-PLAYER_IG_HINTS = {
-    # Manual trusted overrides (can be extended over time).
-    "lucas chevalier": "@_lc30_",
-}
+PLAYER_IG_HINTS: Dict[str, str] = {}
 # Fast mode by default. Set IG_FAST_MODE=0 to force complete mode at startup.
 IG_FAST_MODE_DEFAULT = str(os.getenv("IG_FAST_MODE", "1")).strip().lower() not in ("0", "false", "no")
 
@@ -144,7 +141,33 @@ def count_recent_posts(post_dates: List[dt.datetime]) -> int:
     return sum(1 for d in post_dates if d >= cutoff)
 
 
-def append_log(text: str) -> None:
+_LOG_SEARCH_T0: Optional[float] = None
+_LOG_SEARCH_T_PREV: Optional[float] = None
+
+
+def start_search_log_timing() -> None:
+    global _LOG_SEARCH_T0, _LOG_SEARCH_T_PREV
+    _LOG_SEARCH_T0 = time.perf_counter()
+    _LOG_SEARCH_T_PREV = _LOG_SEARCH_T0
+
+
+def stop_search_log_timing() -> None:
+    global _LOG_SEARCH_T0, _LOG_SEARCH_T_PREV
+    _LOG_SEARCH_T0 = None
+    _LOG_SEARCH_T_PREV = None
+
+
+def append_log(text: str, *, step: bool = False) -> None:
+    global _LOG_SEARCH_T_PREV
+    if step and _LOG_SEARCH_T0 is not None:
+        now = time.perf_counter()
+        total = now - _LOG_SEARCH_T0
+        if _LOG_SEARCH_T_PREV is not None:
+            delta = now - _LOG_SEARCH_T_PREV
+            text = f"{text}  [+{total:.2f}s | Δ{delta:.2f}s]"
+        else:
+            text = f"{text}  [+{total:.2f}s]"
+        _LOG_SEARCH_T_PREV = now
     ensure_app_folders()
     log_path = os.path.join(LOG_DIR, f"app_{dt.date.today().isoformat()}.log")
     with open(log_path, "a", encoding="utf-8") as f:
@@ -374,7 +397,7 @@ def wikidata_search_entity(name: str) -> Optional[str]:
 def wikidata_get_entity(qid: str) -> dict:
     url = (
         "https://www.wikidata.org/w/api.php?"
-        f"action=wbgetentities&ids={quote_plus(qid)}&props=claims|labels&languages=en&format=json"
+        f"action=wbgetentities&ids={quote_plus(qid)}&props=claims|labels&languages=fr|en&format=json"
     )
 
     def _do():
@@ -973,9 +996,6 @@ class SearchFilters:
     ville: str
     saison: str
     saison_start_year: Optional[int]
-    min_followers: int
-    age_min: Optional[int]
-    age_max: Optional[int]
     # No practical cap by default.
     max_profiles: int = 1_000_000
 
@@ -1009,16 +1029,10 @@ class AthleteApp(tk.Tk):
         self._ig_fast_mode_var = tk.BooleanVar(value=IG_FAST_MODE_DEFAULT)
         self._ig_fast_mode_current = bool(IG_FAST_MODE_DEFAULT)
         self._ig_scraper = None
-        self._ig_handle_cache_path = os.path.join(CACHE_DIR, "instagram_handle_cache.json")
-        self._ig_handle_cache: Dict[str, str] = {}
-        self._load_ig_handle_cache()
         if InstagramScraper is not None:
             try:
-                cache_path = os.path.join(CACHE_DIR, "instagram_cache.json")
                 self._ig_scraper = InstagramScraper(
-                    cache_path=cache_path,
                     allow_selenium_fallback=True,
-                    cache_ttl_days=7,
                     logger_fn=append_log,
                 )
             except Exception:
@@ -1028,32 +1042,7 @@ class AthleteApp(tk.Tk):
         self._splash.show("Chargement de l'interface…")
         self.after(50, self._finish_startup)
 
-    def _load_ig_handle_cache(self) -> None:
-        try:
-            if os.path.exists(self._ig_handle_cache_path):
-                with open(self._ig_handle_cache_path, "r", encoding="utf-8") as f:
-                    data = json.load(f) or {}
-                    if isinstance(data, dict):
-                        cleaned: Dict[str, str] = {}
-                        for k, v in data.items():
-                            key = str(k).strip().lower()
-                            hv = normalize_instagram_handle(str(v)) if v else None
-                            # Reject bad cached handles like @popular/... or non-profile paths.
-                            if not hv:
-                                continue
-                            if hv.lstrip("@").startswith("popular"):
-                                continue
-                            cleaned[key] = hv
-                        self._ig_handle_cache = cleaned
-        except Exception:
-            self._ig_handle_cache = {}
-
-    def _save_ig_handle_cache(self) -> None:
-        try:
-            with open(self._ig_handle_cache_path, "w", encoding="utf-8") as f:
-                json.dump(self._ig_handle_cache, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+    # No IG handle cache on disk in dev app.
 
     def _finish_startup(self) -> None:
         self._build_ui()
@@ -1139,42 +1128,31 @@ class AthleteApp(tk.Tk):
 
         ttk.Label(form_row, text="Sport *").grid(row=0, column=0, sticky="w")
         self.sport_var = tk.StringVar(value=DEFAULT_SPORT)
-        self.sport_entry = ttk.Entry(form_row, textvariable=self.sport_var, width=18)
+        self.sport_entry = ttk.Entry(form_row, textvariable=self.sport_var, width=12)
         self.sport_entry.grid(row=0, column=1, padx=6, sticky="ew")
         self.sport_entry.bind("<Return>", lambda _e: self.on_search())
 
         ttk.Label(form_row, text="Club").grid(row=0, column=2, sticky="w")
         self.club_var = tk.StringVar(value=DEFAULT_CLUB)
-        self.club_entry = ttk.Entry(form_row, textvariable=self.club_var, width=22)
+        self.club_entry = ttk.Entry(form_row, textvariable=self.club_var, width=14)
         self.club_entry.grid(row=0, column=3, padx=6, sticky="ew")
         self.club_entry.bind("<Return>", lambda _e: self.on_search())
 
         ttk.Label(form_row, text="Ville").grid(row=0, column=4, sticky="w")
         self.ville_var = tk.StringVar(value=DEFAULT_VILLE)
-        self.ville_entry = ttk.Entry(form_row, textvariable=self.ville_var, width=18)
+        self.ville_entry = ttk.Entry(form_row, textvariable=self.ville_var, width=12)
         self.ville_entry.grid(row=0, column=5, padx=6, sticky="ew")
         self.ville_entry.bind("<Return>", lambda _e: self.on_search())
 
         ttk.Label(form_row, text="Saison").grid(row=0, column=6, sticky="w")
         self.saison_var = tk.StringVar(value=default_season_label())
         self.saison_entry = ttk.Entry(form_row, textvariable=self.saison_var, width=12)
-        self.saison_entry.grid(row=0, column=7, padx=6, sticky="ew")
+        self.saison_entry.grid(row=0, column=7, padx=6, sticky="w")
         self.saison_entry.bind("<Return>", lambda _e: self.on_search())
 
-        ttk.Label(form_row, text="Abonnés min:").grid(row=0, column=8, sticky="e")
-        self.min_followers_var = tk.StringVar(value="5000")
-        ttk.Entry(form_row, textvariable=self.min_followers_var, width=10).grid(row=0, column=9, padx=6)
-
-        ttk.Label(form_row, text="Age min:").grid(row=0, column=10, sticky="e")
-        self.age_min_var = tk.StringVar()
-        ttk.Entry(form_row, textvariable=self.age_min_var, width=7).grid(row=0, column=11, padx=6)
-
-        ttk.Label(form_row, text="Age max:").grid(row=0, column=12, sticky="e")
-        self.age_max_var = tk.StringVar()
-        ttk.Entry(form_row, textvariable=self.age_max_var, width=7).grid(row=0, column=13, padx=6)
-        ttk.Label(form_row, text="Max joueurs:").grid(row=0, column=14, sticky="e")
+        ttk.Label(form_row, text="Max joueurs:").grid(row=0, column=8, sticky="e")
         self.max_profiles_var = tk.StringVar(value="20")
-        ttk.Entry(form_row, textvariable=self.max_profiles_var, width=8).grid(row=0, column=15, padx=6)
+        ttk.Entry(form_row, textvariable=self.max_profiles_var, width=8).grid(row=0, column=9, padx=6, sticky="w")
 
         self.search_btn = ttk.Button(actions_row, text="🔍", width=3, command=self.on_search)
         self.search_btn.grid(row=0, column=0, padx=(0, 8), sticky="w")
@@ -1194,11 +1172,12 @@ class AthleteApp(tk.Tk):
         )
         self.ig_mode_check.grid(row=0, column=7, padx=6, sticky="w")
 
-        # Stabilize form layout so input fields remain visible.
-        form_row.columnconfigure(1, weight=1, minsize=150)
-        form_row.columnconfigure(3, weight=1, minsize=170)
-        form_row.columnconfigure(5, weight=1, minsize=140)
-        form_row.columnconfigure(7, weight=0, minsize=90)
+        # Champs sport/club/ville dynamiques: colonnes 1/3/5 grandissent avec la fenêtre.
+        form_row.columnconfigure(1, weight=2, minsize=120)
+        form_row.columnconfigure(3, weight=3, minsize=160)
+        form_row.columnconfigure(5, weight=2, minsize=120)
+        # Colonnes saison / max joueurs restent compactes.
+        form_row.columnconfigure(7, weight=0, minsize=80)
 
         status_frame = ttk.Frame(self, padding=(10, 0, 10, 5))
         status_frame.pack(fill="x")
@@ -1275,9 +1254,9 @@ class AthleteApp(tk.Tk):
         except Exception:
             pass
 
-    def _set_status(self, text: str) -> None:
+    def _set_status(self, text: str, *, step: bool = False) -> None:
         self.status_var.set(text)
-        append_log(text)
+        append_log(text, step=step)
         # Mirror status messages inside search popup so important steps stay visible.
         if self._search_dialog is not None:
             self._search_dialog.update(
@@ -1322,9 +1301,6 @@ class AthleteApp(tk.Tk):
             messagebox.showwarning(APP_TITLE, "Le champ Sport est obligatoire.")
             return None
         try:
-            min_followers = int(self.min_followers_var.get().strip() or "0")
-            age_min = int(self.age_min_var.get().strip()) if self.age_min_var.get().strip() else None
-            age_max = int(self.age_max_var.get().strip()) if self.age_max_var.get().strip() else None
             max_profiles_text = (self.max_profiles_var.get().strip() if getattr(self, "max_profiles_var", None) else "")
             max_profiles = int(max_profiles_text) if max_profiles_text else 1_000_000
             if max_profiles <= 0:
@@ -1338,9 +1314,6 @@ class AthleteApp(tk.Tk):
             ville=ville,
             saison=saison,
             saison_start_year=saison_start_year,
-            min_followers=min_followers,
-            age_min=age_min,
-            age_max=age_max,
             max_profiles=max_profiles,
         )
 
@@ -1348,10 +1321,12 @@ class AthleteApp(tk.Tk):
         filters = self._get_filters()
         if not filters:
             return
+        start_search_log_timing()
         # Freeze IG mode for the whole search run to avoid mid-run toggles/inconsistent logs.
         self._ig_fast_mode_current = bool(self._ig_fast_mode_var.get())
         append_log(
-            f"[IG] mode recherche courant: {'rapide (DDG)' if self._ig_fast_mode_current else 'complet (Google+DDG+Selenium)'}"
+            f"[IG] mode recherche courant: {'rapide (DDG)' if self._ig_fast_mode_current else 'complet (Google+DDG+Selenium)'}",
+            step=True,
         )
         if self._ig_scraper is not None:
             try:
@@ -1362,7 +1337,7 @@ class AthleteApp(tk.Tk):
         self._search_cancel_event = threading.Event()
         self._search_cancel_requested = False
         self.search_btn.configure(state="disabled")
-        self._set_status("Recherche en cours...")
+        self._set_status("Recherche en cours...", step=True)
         if self._search_dialog is not None:
             self._search_dialog.close()
         self._search_progress_current = 0
@@ -1378,7 +1353,7 @@ class AthleteApp(tk.Tk):
         if self._search_cancel_event is not None:
             self._search_cancel_event.set()
         if not self._search_cancel_requested:
-            append_log("Annulation demandée par l'utilisateur.")
+            append_log("Annulation demandée par l'utilisateur.", step=True)
             self._search_cancel_requested = True
 
     def _raise_if_cancelled(self) -> None:
@@ -1405,16 +1380,17 @@ class AthleteApp(tk.Tk):
                 self.after(
                     0,
                     lambda: self._set_status(
-                        "Aucun profil trouvé. Essayez Abonnés min=0 ou précisez Club/Ville."
+                        "Aucun profil trouvé. Précisez Club / Ville ou la saison.",
+                        step=True,
                     ),
                 )
             else:
-                self.after(0, lambda: self._set_status(f"{len(rows)} profils trouvés."))
-                self.after(0, lambda: self._autosave_csv(filters.query))
+                self.after(0, lambda: self._set_status(f"{len(rows)} profils trouvés.", step=True))
+                self.after(0, lambda: self._autosave_csv(filters.query, timing_step=True))
                 self.after(0, lambda: self._build_final_results_from_table())
         except SearchCancelled:
-            self.after(0, lambda: self._set_status("Recherche annulée."))
-            self.after(0, lambda: self._autosave_csv(filters.query))
+            self.after(0, lambda: self._set_status("Recherche annulée.", step=True))
+            self.after(0, lambda: self._autosave_csv(filters.query, timing_step=True))
             self.after(0, lambda: self._build_final_results_from_table())
         except Exception as exc:
             append_log(traceback.format_exc())
@@ -1423,6 +1399,7 @@ class AthleteApp(tk.Tk):
             bind_search_cancel_event(None)
             self.after(0, self._close_search_dialog)
             self.after(0, lambda: self.search_btn.configure(state="normal"))
+            self.after(0, stop_search_log_timing)
 
     def _search_wikidata_roster(self, filters: SearchFilters) -> List[Dict[str, str]]:
         club = (filters.club or "").strip()
@@ -1521,13 +1498,6 @@ class AthleteApp(tk.Tk):
                         append_log(f"Fallback Wikipedia enrichissement échoué ({name}): {ex2}")
 
                     # Age filters (same behavior as roster)
-                    if filters.age_min is not None and row["Age"].isdigit() and int(row["Age"]) < filters.age_min:
-                        append_log(f"Fallback Wikipedia: rejet {name} (âge {row['Age']} < min {filters.age_min})")
-                        continue
-                    if filters.age_max is not None and row["Age"].isdigit() and int(row["Age"]) > filters.age_max:
-                        append_log(f"Fallback Wikipedia: rejet {name} (âge {row['Age']} > max {filters.age_max})")
-                        continue
-
                     rows.append(row)
                     self.after(0, lambda rr=dict(row): self._add_rows([rr]))
                     self.after(
@@ -1543,8 +1513,6 @@ class AthleteApp(tk.Tk):
 
         rows: List[Dict[str, str]] = []
         analyzed = 0
-        ig_stats = {"handles": 0, "bio": 0, "followers": 0, "posts": 0}
-        rejected = 0
         for p in players:
             self._raise_if_cancelled()
             if len(rows) >= filters.max_profiles:
@@ -1570,16 +1538,6 @@ class AthleteApp(tk.Tk):
             row["Niveau Barème"] = ""
             row["Priorité"] = ""
 
-            # Age filters: reject and log (keep going).
-            if filters.age_min is not None and row["Age"].isdigit() and int(row["Age"]) < filters.age_min:
-                rejected += 1
-                append_log(f"Wikidata: rejet {name} (âge {row['Age']} < min {filters.age_min})")
-                continue
-            if filters.age_max is not None and row["Age"].isdigit() and int(row["Age"]) > filters.age_max:
-                rejected += 1
-                append_log(f"Wikidata: rejet {name} (âge {row['Age']} > max {filters.age_max})")
-                continue
-
             # Info en bio: Instagram uniquement (laisser vide si non trouvé).
 
             # Followers/posts via web scraping is best-effort; keep empty if fails.
@@ -1592,8 +1550,6 @@ class AthleteApp(tk.Tk):
                 ),
             )
 
-        if rejected:
-            append_log(f"Wikidata: {rejected} joueurs rejetés par filtres (âge).")
         return rows
 
     def _format_user_error(self, exc: Exception) -> str:
@@ -1608,7 +1564,6 @@ class AthleteApp(tk.Tk):
                 "Actions conseillées:\n"
                 "- Réessayer plus tard.\n"
                 "- Utiliser un VPN.\n"
-                "- Mettre Abonnés min = 0 si vous n'êtes pas connecté à Instagram.\n"
                 "- Vérifier que Google Chrome est installé (fallback web Selenium).\n\n"
                 f"Détail technique: {msg}"
             )
@@ -1816,13 +1771,6 @@ class AthleteApp(tk.Tk):
 
                 # Instagram enrichment removed (web-only). Keep nullable.
 
-                # Si on n'a pas pu enrichir via Instagram, on garde quand même le profil en mode Web,
-                # et on n'applique pas le filtre "abonnés min" (valeur inconnue).
-                if row["Nombre d'abonnés"]:
-                    followers = int(row["Nombre d'abonnés"] or "0")
-                    if followers < filters.min_followers:
-                        continue
-
                 rows.append(row)
                 self.after(0, lambda rr=dict(row): self._add_rows([rr]))
                 self.after(
@@ -1909,30 +1857,6 @@ class AthleteApp(tk.Tk):
         if not out.get("instagram"):
             try:
                 key = (name or "").strip().lower()
-                # Manual trusted mapping FIRST: avoids stale/empty cache preventing real attempts.
-                manual_handle = PLAYER_IG_HINTS.get(key)
-                if manual_handle:
-                    manual_norm = normalize_instagram_handle(manual_handle)
-                    if manual_norm:
-                        out["instagram"] = manual_norm
-                        handle_source = "manual"
-                        self._ig_handle_cache[key] = manual_norm
-                        self._save_ig_handle_cache()
-                        append_log(f"[IG] {name}: handle manuel {manual_norm}")
-
-                if not out.get("instagram"):
-                    cached_handle = self._ig_handle_cache.get(key)
-                    if cached_handle:
-                        valid_cached = normalize_instagram_handle(cached_handle)
-                        if valid_cached and not valid_cached.lstrip("@").startswith("popular"):
-                            out["instagram"] = valid_cached
-                            handle_source = "cache"
-                            append_log(f"[IG] {name}: handle cache {valid_cached}")
-                        else:
-                            append_log(f"[IG] {name}: handle cache ignoré (invalide)")
-                            self._ig_handle_cache.pop(key, None)
-                            self._save_ig_handle_cache()
-
                 guessed = out.get("instagram") if out.get("instagram") else None
                 guessed_preexisting = bool(guessed)
 
@@ -1960,11 +1884,9 @@ class AthleteApp(tk.Tk):
                         guessed_norm = None
                     if guessed_norm:
                         out["instagram"] = guessed_norm
-                        # Preserve original source (manual/cache/wikidata/input) when handle already existed.
+                        # Preserve original source (manual/wikidata/input) when handle already existed.
                         if not guessed_preexisting:
                             handle_source = "discovered"
-                        self._ig_handle_cache[key] = guessed_norm
-                        self._save_ig_handle_cache()
                         append_log(f"[IG] {name}: handle trouvé {guessed_norm}")
                     else:
                         append_log(f"[IG] {name}: handle introuvable")
@@ -2412,8 +2334,8 @@ class AthleteApp(tk.Tk):
         except ImportError:
             append_log("[IG] Installez duckduckgo-search: pip install duckduckgo-search")
             return None
+        # Sans guillemets : « "Prénom Nom" instagram » renvoie souvent 0 lien IG sur DDGS.
         queries = [
-            f'"{name}" instagram',
             f"{name} instagram",
             f"instagram {name}",
         ]
@@ -2512,9 +2434,9 @@ class AthleteApp(tk.Tk):
         }
         # Several queries + HTML endpoints: DDG often returns empty/minimal HTML on one combination.
         queries = [
-            f'"{name}" instagram',
-            f'site:instagram.com "{name}" football',
             f"{name} instagram",
+            f"instagram {name}",
+            f"site:instagram.com {name} football",
         ]
         endpoints = [
             "https://html.duckduckgo.com/html/?q=",
@@ -2596,7 +2518,7 @@ class AthleteApp(tk.Tk):
         Lightweight Google HTTP lookup (no Selenium): keep the first valid Instagram profile link.
         Useful when DDG returns empty SERP to script requests.
         """
-        q = f'"{name}" instagram {club_hint}'.strip()
+        q = f"{name} instagram {club_hint}".strip()
         url = f"https://www.google.com/search?hl=fr&num=10&q={quote_plus(q)}"
         headers = {
             "User-Agent": (
@@ -2653,7 +2575,7 @@ class AthleteApp(tk.Tk):
             options.add_argument("--disable-blink-features=AutomationControlled")
             driver = webdrv.Chrome(options=options)
 
-            q = f'"{name}" instagram {club_hint}'.strip()
+            q = f"{name} instagram {club_hint}".strip()
             driver.get(f"https://www.google.com/search?q={quote_plus(q)}")
             self._sleep_with_cancel(1.8)
 
@@ -2733,7 +2655,7 @@ class AthleteApp(tk.Tk):
             options.add_argument("--disable-gpu")
             options.add_argument("--window-size=1400,900")
             driver = webdrv.Chrome(options=options)
-            q = f'site:instagram.com "{name}" football'
+            q = f"site:instagram.com {name} football"
             driver.get(f"https://duckduckgo.com/?q={quote_plus(q)}")
             self._sleep_with_cancel(1.5)
             links = driver.find_elements(by_cls.CSS_SELECTOR, "a[href*='instagram.com/']")
@@ -2868,11 +2790,11 @@ class AthleteApp(tk.Tk):
 
         return out
 
-    def _autosave_csv(self, query: str) -> None:
+    def _autosave_csv(self, query: str, *, timing_step: bool = False) -> None:
         if not self.current_csv_path:
             self.current_csv_path = generate_search_csv_path(query)
         self._write_csv(self.current_csv_path)
-        self._set_status(f"Auto-sauvegarde: {self.current_csv_path}")
+        self._set_status(f"Auto-sauvegarde: {self.current_csv_path}", step=timing_step)
 
     def on_export_csv(self) -> None:
         suggested_name = generate_export_filename(self._current_search_text())

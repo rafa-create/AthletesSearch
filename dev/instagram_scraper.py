@@ -15,10 +15,9 @@ class InstagramScraper:
     """
     Best-effort Instagram public scraper (no login).
 
-    - Caches results on disk to avoid re-fetching the same profile.
-    - Enforces a global rate-limit (>= 15s between requests).
-    - Uses simple HTML regex parsing; optionally falls back to Selenium page_source.
-    - Never throws to callers by default (returns null fields on failure).
+    - Pas de cache disque : chaque get_profile refait un appel (tests et diagnostic fiables).
+    - Rate-limit global (intervalle entre requêtes).
+    - Parse HTML par regex ; repli Selenium optionnel sur page_source.
     """
 
     FOLLOWERS_RE = re.compile(r'"edge_followed_by"\s*:\s*\{"count":\s*(\d+)', re.IGNORECASE)
@@ -30,40 +29,20 @@ class InstagramScraper:
 
     def __init__(
         self,
-        cache_path: str,
         allow_selenium_fallback: bool = True,
-        cache_ttl_days: int = 7,
         logger_fn=None,
     ) -> None:
-        self.cache_path = cache_path
         self.allow_selenium_fallback = allow_selenium_fallback
-        self.cache_ttl_days = max(1, int(cache_ttl_days))
         self._logger_fn = logger_fn
         self._ua = UserAgent() if UserAgent is not None else None
-        self._cache = {}
         self._last_request_ts = 0.0
         self._burst_count = 0
         self._degraded_until_by_user = {}
         self._last_json_status_by_user = {}
         self._fast_mode = False
-        self._load_cache()
 
     def set_fast_mode(self, enabled: bool) -> None:
         self._fast_mode = bool(enabled)
-
-    def _load_cache(self) -> None:
-        try:
-            with open(self.cache_path, "r", encoding="utf-8") as f:
-                self._cache = json.load(f) or {}
-        except Exception:
-            self._cache = {}
-
-    def _save_cache(self) -> None:
-        try:
-            with open(self.cache_path, "w", encoding="utf-8") as f:
-                json.dump(self._cache, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
 
     def _log(self, msg: str) -> None:
         if callable(self._logger_fn):
@@ -157,11 +136,24 @@ class InstagramScraper:
             followers = user.get("edge_followed_by", {}).get("count")
             posts = user.get("edge_owner_to_timeline_media", {}).get("count")
             bio = (user.get("biography") or "").strip() or None
+            # Posts publiés dans les ~90 derniers jours (fenêtre du fil d’aperçu renvoyé par l’API, souvent ≤12).
+            posts_last_90d = None
+            try:
+                cutoff = int(time.time()) - 90 * 86400
+                edges = (user.get("edge_owner_to_timeline_media") or {}).get("edges") or []
+                posts_last_90d = sum(
+                    1
+                    for e in edges
+                    if int((e or {}).get("node", {}).get("taken_at_timestamp") or 0) >= cutoff
+                )
+            except Exception:
+                posts_last_90d = None
             return {
                 "username": u,
                 "followers": int(followers) if isinstance(followers, int) else None,
                 "posts": int(posts) if isinstance(posts, int) else None,
                 "bio": bio,
+                "posts_last_90d": posts_last_90d,
             }
         except Exception:
             return None
@@ -179,7 +171,7 @@ class InstagramScraper:
         )
 
     def _parse_from_html(self, username: str, html_text: str) -> dict:
-        out = {"username": username, "followers": None, "posts": None, "bio": None}
+        out = {"username": username, "followers": None, "posts": None, "bio": None, "posts_last_90d": None}
         if not html_text:
             self._log(f"[IG] @{username} parse skip: empty html")
             return out
@@ -233,7 +225,91 @@ class InstagramScraper:
             f"bio={'yes' if bool(out['bio']) else 'no'}"
         )
 
+        if out.get("posts_last_90d") is None:
+            p90 = self._parse_posts_last_90d_from_instagram_html(html_text)
+            if p90 is not None:
+                out["posts_last_90d"] = p90
+                self._log(f"[IG] @{username} posts_90j from embedded HTML: {p90}")
+
         return out
+
+    def _parse_posts_last_90d_from_instagram_html(self, html_text: str) -> int | None:
+        """
+        When the JSON API returns 401, the public HTML may still embed GraphQL-shaped JSON
+        with taken_at_timestamp for the preview grid — count posts within ~90 days.
+        """
+        if not html_text or "edge_owner_to_timeline_media" not in html_text:
+            return None
+        idx = html_text.find("edge_owner_to_timeline_media")
+        chunk = html_text[idx : idx + 650_000]
+        cutoff = int(time.time()) - 90 * 86400
+        ts: list[int] = []
+        for m in re.finditer(r'"taken_at_timestamp"\s*:\s*(\d+)', chunk):
+            try:
+                ts.append(int(m.group(1)))
+            except Exception:
+                continue
+        if not ts:
+            return None
+        if len(ts) > 64:
+            ts = ts[:64]
+        return sum(1 for t in ts if t >= cutoff)
+
+    def _explain_posts_90j_none_from_html(self, html_text: str) -> str:
+        """Raison courte (FR) si _parse_posts_last_90d_from_instagram_html aurait renvoyé None."""
+        if not html_text:
+            return "aucun HTML"
+        if "edge_owner_to_timeline_media" not in html_text:
+            return "pas de chaîne edge_owner_to_timeline_media dans la page"
+        idx = html_text.find("edge_owner_to_timeline_media")
+        chunk = html_text[idx : idx + 650_000]
+        if not re.search(r'"taken_at_timestamp"\s*:\s*(\d+)', chunk):
+            if re.search(r'"taken_at_timestamp"\s*:\s*(\d+)', html_text):
+                return "taken_at_timestamp présents ailleurs que dans le segment fil (page fragmentée)"
+            return "pas de taken_at_timestamp dans le segment du fil d’aperçu"
+        return "comptage 90j impossible (incohérence parse)"
+
+    def _log_posts_90j_none(
+        self,
+        u: str,
+        *,
+        json_ok: bool,
+        json_data: dict | None,
+        last_html: str | None,
+        final: dict,
+    ) -> None:
+        """Log une ligne explicite lorsque posts_last_90d reste None."""
+        if final.get("posts_last_90d") is not None:
+            return
+        st = self._last_json_status_by_user.get(u)
+        api = f"HTTP {st}" if st is not None else "n/a"
+
+        if json_ok and json_data is not None:
+            self._log(
+                f"[IG] @{u} posts_90j=None: JSON reçu mais comptage 90j impossible "
+                f"(edges vides, pas de taken_at_timestamp, ou exception dans le parse)"
+            )
+            return
+
+        parts: list[str] = []
+        if st == 401:
+            parts.append("API JSON 401 (refus / session requise côté Instagram)")
+        elif st in (403, 404, 429):
+            parts.append(f"API JSON {st}")
+        elif st is not None and st >= 400:
+            parts.append(f"API JSON {st}")
+        else:
+            parts.append(f"API JSON indisponible ou vide ({api})")
+
+        if not last_html:
+            parts.append("aucun HTML exploitable après repli")
+            self._log(f"[IG] @{u} posts_90j=None: " + " ; ".join(parts))
+            return
+        if self._looks_blocked(last_html):
+            parts.append("HTML interprété comme page bloquée / login")
+        else:
+            parts.append(self._explain_posts_90j_none_from_html(last_html))
+        self._log(f"[IG] @{u} posts_90j=None: " + " ; ".join(parts))
 
     def _parse_km_int(self, num_str: str, suffix: str) -> int | None:
         try:
@@ -274,7 +350,7 @@ class InstagramScraper:
     def get_profile(self, username: str, force_refresh: bool = False) -> dict:
         u = (username or "").strip().lstrip("@")
         if not u:
-            return {"username": "", "followers": None, "posts": None, "bio": None}
+            return {"username": "", "followers": None, "posts": None, "bio": None, "posts_last_90d": None}
 
         # Fast-fail window when Instagram public surface is temporarily unusable for this handle.
         now = time.time()
@@ -282,55 +358,11 @@ class InstagramScraper:
         if now < degraded_until:
             remaining = int(degraded_until - now)
             self._log(f"[IG] @{u} skip scrape (degraded mode handle {remaining}s)")
-            return {"username": u, "followers": None, "posts": None, "bio": None}
+            self._log(f"[IG] @{u} posts_90j=None: scrape ignoré (mode dégradé {remaining}s)")
+            return {"username": u, "followers": None, "posts": None, "bio": None, "posts_last_90d": None}
 
-        # Cache with TTL to keep data relatively fresh.
-        cached = self._cache.get(u)
-        if (not force_refresh) and isinstance(cached, dict):
-            cached_has_data = bool(
-                cached.get("bio")
-                or cached.get("followers") is not None
-                or cached.get("posts") is not None
-            )
-            updated = cached.get("updated_at")
-            if isinstance(updated, (int, float)):
-                age_s = time.time() - float(updated)
-                if age_s <= self.cache_ttl_days * 86400:
-                    if cached_has_data:
-                        self._log(f"[IG] @{u} cache hit (age={int(age_s)}s)")
-                    else:
-                        self._log(f"[IG] @{u} cache hit (empty, age={int(age_s)}s)")
-                    return {
-                        "username": cached.get("username") or u,
-                        "followers": cached.get("followers"),
-                        "posts": cached.get("posts"),
-                        "bio": cached.get("bio"),
-                    }
-                # Negative cache: avoid hammering same empty profile for 1 hour.
-                if (not cached_has_data) and age_s <= 3600:
-                    self._log(f"[IG] @{u} cache hit (empty-recent, age={int(age_s)}s)")
-                    return {
-                        "username": cached.get("username") or u,
-                        "followers": None,
-                        "posts": None,
-                        "bio": None,
-                    }
-                if not cached_has_data:
-                    self._log(f"[IG] @{u} cache empty expired (age={int(age_s)}s), refresh")
-            # legacy entries without timestamp: keep them for 1 day then refresh
-            if "updated_at" not in cached:
-                if cached_has_data:
-                    self._log(f"[IG] @{u} cache hit (legacy)")
-                else:
-                    self._log(f"[IG] @{u} cache hit (legacy-empty)")
-                return {
-                    "username": cached.get("username") or u,
-                    "followers": cached.get("followers"),
-                    "posts": cached.get("posts"),
-                    "bio": cached.get("bio"),
-                }
-        elif force_refresh:
-            self._log(f"[IG] @{u} force refresh requested")
+        if force_refresh:
+            self._log(f"[IG] @{u} fetch prioritaire (handle manuel / découvert)")
 
         # Anti-block pacing between profile attempts.
         if self._fast_mode:
@@ -344,16 +376,13 @@ class InstagramScraper:
         if json_data is not None:
             self._log(
                 f"[IG] @{u} JSON parsed followers={json_data.get('followers')} "
-                f"posts={json_data.get('posts')} bio={'yes' if json_data.get('bio') else 'no'}"
+                f"posts={json_data.get('posts')} posts_90j={json_data.get('posts_last_90d')} "
+                f"bio={'yes' if json_data.get('bio') else 'no'}"
             )
-            self._cache[u] = {
-                "username": json_data.get("username") or u,
-                "followers": json_data.get("followers"),
-                "posts": json_data.get("posts"),
-                "bio": json_data.get("bio"),
-                "updated_at": time.time(),
-            }
-            self._save_cache()
+            if json_data.get("posts_last_90d") is None:
+                self._log_posts_90j_none(
+                    u, json_ok=True, json_data=json_data, last_html=None, final=json_data
+                )
             return json_data
 
         # Step 2: HTML fallback
@@ -378,7 +407,7 @@ class InstagramScraper:
                 self._log(f"[IG] @{u} selenium fallback unusable")
 
         if not last or self._looks_blocked(last):
-            data = {"username": u, "followers": None, "posts": None, "bio": None}
+            data = {"username": u, "followers": None, "posts": None, "bio": None, "posts_last_90d": None}
             self._log(f"[IG] @{u} no data")
         else:
             data = self._parse_from_html(u, last)
@@ -426,32 +455,29 @@ class InstagramScraper:
             self._degraded_until_by_user[u] = time.time() + 600  # 10 min per handle
             self._log(f"[IG] @{u} degraded mode enabled for handle (600s)")
 
-        self._cache[u] = {
-            "username": data.get("username") or u,
-            "followers": data.get("followers"),
-            "posts": data.get("posts"),
-            "bio": data.get("bio"),
-            "updated_at": time.time(),
-        }
-        self._save_cache()
+        if data.get("posts_last_90d") is None:
+            self._log_posts_90j_none(
+                u, json_ok=False, json_data=None, last_html=last, final=data
+            )
+
         return data
 
     def probe(self) -> bool:
-        """
-        Quick startup probe. Cache-only to avoid wasting requests at startup.
-        """
+        """Test léger au démarrage : page d’accueil Instagram (pas de cache)."""
         try:
-            cached = self._cache.get("instagram")
-            if not isinstance(cached, dict):
-                self._log("[IG] probe cache-miss")
-                return False
-            has_data = bool(
-                cached.get("bio")
-                or cached.get("followers") is not None
-                or cached.get("posts") is not None
+            r = requests.get(
+                "https://www.instagram.com/",
+                headers={
+                    "User-Agent": self._random_ua(),
+                    "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+                    "Referer": "https://www.google.com/",
+                },
+                timeout=12,
             )
-            self._log(f"[IG] probe cache {'ok' if has_data else 'empty'}")
-            return has_data
-        except Exception:
+            ok = r.status_code == 200 and len(r.text or "") > 800
+            self._log(f"[IG] probe HTTP {r.status_code} (accueil) ok={ok}")
+            return bool(ok)
+        except Exception as ex:
+            self._log(f"[IG] probe échec: {ex}")
             return False
 
