@@ -1307,7 +1307,7 @@ class AthleteApp(tk.Tk):
         ttk.Button(actions_row, text="Charger CSV", command=self.on_load_csv).grid(row=0, column=2, padx=4, sticky="w")
         ttk.Button(actions_row, text="Exporter en CSV", command=self.on_export_csv).grid(row=0, column=3, padx=4, sticky="w")
         ttk.Button(actions_row, text="Exporter Excel (template)", command=self.on_export_excel).grid(row=0, column=4, padx=4, sticky="w")
-        ttk.Button(actions_row, text="+", width=3, command=self.on_add_manual).grid(row=0, column=5, padx=4, sticky="w")
+        ttk.Button(actions_row, text="meissa le coquin", command=self.on_add_manual).grid(row=0, column=5, padx=4, sticky="w")
         ttk.Button(actions_row, text="-", width=3, command=self.on_delete_selected_rows).grid(
             row=0, column=6, padx=4, sticky="w"
         )
