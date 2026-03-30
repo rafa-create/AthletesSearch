@@ -57,6 +57,7 @@ CACHE_DIR = os.path.join(APP_DIR, ".appdata")
 LOG_DIR = os.path.join(CACHE_DIR, "logs")
 # Internal app data under .appdata to avoid root pollution.
 DATA_DIR = os.path.join(CACHE_DIR, "Data")
+PENDING_CSV_PATH = os.path.join(CACHE_DIR, "pending_csv_after_update.txt")
 _single_instance_socket = None
 # Instagram login removed (web-only)
 DEFAULT_SPORT = "foot"
@@ -1146,6 +1147,38 @@ class AthleteApp(tk.Tk):
         self.deiconify()
         # Instagram init via instaloader removed; keep status neutral.
         self._set_status("Prêt.")
+        # One-shot restore of active CSV after an app update relaunch.
+        self.after(120, self._restore_pending_csv_after_update)
+
+    def _save_pending_csv_for_update(self) -> None:
+        try:
+            path = (self.current_csv_path or "").strip()
+            if not path or not os.path.exists(path):
+                if os.path.exists(PENDING_CSV_PATH):
+                    os.remove(PENDING_CSV_PATH)
+                return
+            with open(PENDING_CSV_PATH, "w", encoding="utf-8") as f:
+                f.write(path)
+        except Exception:
+            pass
+
+    def _restore_pending_csv_after_update(self) -> None:
+        try:
+            if not os.path.exists(PENDING_CSV_PATH):
+                return
+            with open(PENDING_CSV_PATH, "r", encoding="utf-8") as f:
+                path = (f.read() or "").strip()
+            try:
+                os.remove(PENDING_CSV_PATH)
+            except Exception:
+                pass
+            if not path or not os.path.exists(path):
+                return
+            self._load_csv(path)
+            self.current_csv_path = path
+            self._set_status(f"CSV restauré après mise à jour: {path}")
+        except Exception:
+            pass
 
     def _start_background_checks(self) -> None:
         t = threading.Thread(target=self._check_chrome_setup_non_blocking, daemon=True)
@@ -1258,12 +1291,10 @@ class AthleteApp(tk.Tk):
         ttk.Button(actions_row, text="Charger CSV", command=self.on_load_csv).grid(row=0, column=2, padx=4, sticky="w")
         ttk.Button(actions_row, text="Exporter en CSV", command=self.on_export_csv).grid(row=0, column=3, padx=4, sticky="w")
         ttk.Button(actions_row, text="Exporter Excel (template)", command=self.on_export_excel).grid(row=0, column=4, padx=4, sticky="w")
-        ttk.Button(actions_row, text="Ajouter ligne", command=self.on_add_manual).grid(row=0, column=5, padx=4, sticky="w")
-        ttk.Button(actions_row, text="Supprimer ligne(s)", command=self.on_delete_selected_rows).grid(
+        ttk.Button(actions_row, text="+", width=3, command=self.on_add_manual).grid(row=0, column=5, padx=4, sticky="w")
+        ttk.Button(actions_row, text="-", width=3, command=self.on_delete_selected_rows).grid(
             row=0, column=6, padx=4, sticky="w"
         )
-        ttk.Button(actions_row, text="Aide", command=self.on_help).grid(row=0, column=7, padx=4, sticky="w")
-
         self.toggle_logs_btn = ttk.Button(actions_row, text="Afficher logs", command=self._toggle_logs)
         self.toggle_logs_btn.grid(row=0, column=8, padx=10, sticky="w")
         self.ig_mode_check = ttk.Checkbutton(
@@ -2916,6 +2947,8 @@ class AthleteApp(tk.Tk):
         ):
             return
         try:
+            # Persist currently opened CSV so the relaunched app restores it.
+            self._save_pending_csv_for_update()
             # Spawn an updater UI that survives closing the app.
             ui_py = os.path.join(APP_DIR, "update_ui.py")
             if os.path.exists(ui_py):
