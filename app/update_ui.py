@@ -36,6 +36,10 @@ def main() -> int:
     status_var = tk.StringVar(value=f"Journal: {log_path}")
     ttk.Label(root, textvariable=status_var).pack(anchor="w", padx=12, pady=(0, 10))
 
+    result_var = tk.StringVar(value="Statut: mise à jour en cours…")
+    result_lbl = ttk.Label(root, textvariable=result_var)
+    result_lbl.pack(anchor="w", padx=12, pady=(0, 6))
+
     btn_row = ttk.Frame(root)
     btn_row.pack(fill="x", padx=12, pady=(0, 10))
     ttk.Button(btn_row, text="Fermer", command=root.destroy).pack(side="right")
@@ -47,12 +51,35 @@ def main() -> int:
         box.see("end")
         box.configure(state="disabled")
 
+    done_state = {"done": False}
+
     def poll() -> None:
         try:
             if os.path.exists(log_path):
                 with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
                     content = f.read()
                 set_text(content)
+
+                # Final state detection
+                if not done_state["done"]:
+                    has_error = "[ERREUR]" in content
+                    is_done = ("Fin:" in content) or ("exit_code" in content)  # defensive
+                    if is_done:
+                        done_state["done"] = True
+                        if has_error:
+                            root.title("Mise à jour Athletes Searcher — ERREUR")
+                            result_var.set("Statut: MAJ ERREUR (voir le journal ci-dessus).")
+                            try:
+                                result_lbl.configure(foreground="#b00020")
+                            except Exception:
+                                pass
+                        else:
+                            root.title("Mise à jour Athletes Searcher — OK")
+                            result_var.set("Statut: MAJ OK. Vous pouvez fermer cette fenêtre.")
+                            try:
+                                result_lbl.configure(foreground="#0b6b0b")
+                            except Exception:
+                                pass
             else:
                 set_text("En attente du journal de mise à jour…")
         except Exception as e:

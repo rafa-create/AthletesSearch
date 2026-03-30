@@ -2,14 +2,17 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Run Athletes Searcher (.buildvenv)",
-      "type": "debugpy",
+      "name": "Lancer Athletes Searcher (.bat)",
+      "type": "node",
       "request": "launch",
-      "python": "${workspaceFolder}\\app\\.buildvenv\\Scripts\\python.exe",
-      "program": "${workspaceFolder}\\app\\app.py",
+      "runtimeExecutable": "${env:WINDIR}\\System32\\cmd.exe",
+      "runtimeArgs": [
+        "/c",
+        "${workspaceFolder}\\Lancer_AthletesSearcher.bat"
+      ],
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
-      "justMyCode": true
+      "internalConsoleOptions": "neverOpen"
     }
   ]
 }
