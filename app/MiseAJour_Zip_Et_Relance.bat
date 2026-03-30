@@ -73,14 +73,15 @@ if exist "%SRC_DIR%\Lancer_AthletesSearcher.bat" (
 echo [4/5] Mise a jour dependances (si venv present)...>>"%LOG_FILE%"
 
 rem 4) Update deps if venv present
-set "PY_EXE=%ROOT_DIR%\app\.buildvenv\Scripts\python.exe"
-if exist "%PY_EXE%" goto :do_pip
+set "PY_EXE=%ROOT_DIR%\app\.buildvenv\Scripts\pythonw.exe"
+set "PIP_PY=%ROOT_DIR%\app\.buildvenv\Scripts\python.exe"
+if exist "%PIP_PY%" goto :do_pip
 echo [4/5] Venv .buildvenv absent, dependances non mises a jour.>>"%LOG_FILE%"
 goto :after_pip
 
 :do_pip
 echo [4/5] Mise a jour dependances (pip install -r app\requirements.txt)...>>"%LOG_FILE%"
-"%PY_EXE%" -m pip install -r "%ROOT_DIR%\app\requirements.txt" >>"%LOG_FILE%" 2>&1
+"%PIP_PY%" -m pip install -r "%ROOT_DIR%\app\requirements.txt" >>"%LOG_FILE%" 2>&1
 
 :after_pip
 
@@ -89,6 +90,21 @@ echo [5/5] Relance de l'application...>>"%LOG_FILE%"
 if exist "%PY_EXE%" (
   start "" "%PY_EXE%" "%ROOT_DIR%\app\app.py"
 ) else (
+  set "FALLBACK_PYW=%ROOT_DIR%\app\.buildvenv\Scripts\pythonw.exe"
+  set "FALLBACK_PY=%ROOT_DIR%\app\.buildvenv\Scripts\python.exe"
+  if exist "%FALLBACK_PYW%" (
+    start "" "%FALLBACK_PYW%" "%ROOT_DIR%\app\app.py"
+    goto :end_launch
+  )
+  if exist "%FALLBACK_PY%" (
+    start "" "%FALLBACK_PY%" "%ROOT_DIR%\app\app.py"
+    goto :end_launch
+  )
+  where pythonw >nul 2>&1
+  if not errorlevel 1 (
+    start "" pythonw "%ROOT_DIR%\app\app.py"
+    goto :end_launch
+  )
   where python >nul 2>&1
   if errorlevel 1 (
     echo [ERREUR] Python introuvable.>>"%LOG_FILE%"
@@ -96,6 +112,7 @@ if exist "%PY_EXE%" (
   )
   start "" python "%ROOT_DIR%\app\app.py"
 )
+:end_launch
 
 echo Fin: %DATE% %TIME%>>"%LOG_FILE%"
 exit /b 0
