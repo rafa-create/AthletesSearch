@@ -1816,7 +1816,10 @@ class AthleteApp(tk.Tk):
                 append_log("Recherche joueurs: aucun nom détecté (0).")
                 return []
 
-            total_candidates = min(len(player_names), filters.max_profiles * 2)
+            # Progress should reflect the actual number of profiles we will try to retain.
+            # The loop stops once we have `max_profiles` retained rows, so using `*2` makes the bar
+            # stop at 50/66% for small runs (1-2 profiles).
+            total_candidates = min(len(player_names), max(1, int(filters.max_profiles)))
             self.after(
                 0,
                 lambda t=total_candidates: (
@@ -1911,6 +1914,16 @@ class AthleteApp(tk.Tk):
                         i, f"Profil retenu: {n}", analyzed=a, retained=r
                     ),
                 )
+            # Ensure progress reaches 100% (especially when we stop early due to max_profiles).
+            try:
+                self.after(
+                    0,
+                    lambda t=total_candidates, a=analyzed, r=len(rows): self._update_search_dialog(
+                        t, "Enrichissement terminé.", analyzed=a, retained=r
+                    ),
+                )
+            except Exception:
+                pass
             append_log(
                 "Résumé IG: "
                 f"handles={ig_stats['handles']}/{len(rows)} "
