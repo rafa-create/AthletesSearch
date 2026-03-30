@@ -14,6 +14,9 @@ import json
 import random
 import subprocess
 import sys
+import platform
+import tempfile
+import stat
 from dataclasses import dataclass
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Dict, List, Optional
@@ -60,6 +63,18 @@ LOG_DIR = os.path.join(CACHE_DIR, "logs")
 DATA_DIR = os.path.join(CACHE_DIR, "Data")
 PENDING_CSV_PATH = os.path.join(CACHE_DIR, "pending_csv_after_update.txt")
 _single_instance_socket = None
+def _is_frozen() -> bool:
+    return bool(getattr(sys, "frozen", False))
+
+
+def _resource_path(rel: str) -> str:
+    """
+    Path helper compatible with PyInstaller (.app/.exe).
+    When frozen, resources are unpacked under sys._MEIPASS.
+    """
+    base = getattr(sys, "_MEIPASS", APP_DIR)
+    return os.path.join(base, rel)
+
 # Instagram login removed (web-only)
 DEFAULT_SPORT = "foot"
 DEFAULT_VILLE = "paris"
@@ -2939,11 +2954,21 @@ class AthleteApp(tk.Tk):
         Update button for the 'git + venv' delivery: closes the app, pulls latest code, updates deps,
         and relaunches app via batch script.
         """
-        # ZIP updater: works even when client has no Git installed.
-        bat = os.path.join(APP_DIR, "MiseAJour_Zip_Et_Relance.bat")
-        if not os.path.exists(bat):
-            messagebox.showerror(APP_TITLE, f"Script de mise à jour introuvable:\n{bat}")
-            return
+        # Platform-specific updater:
+        # - Windows: ZIP updater (.bat) works even when client has no Git installed.
+        # - macOS: updater script replaces the packaged .app (latest GitHub Release asset).
+        is_macos = sys.platform == "darwin"
+        is_windows = os.name == "nt"
+        if is_macos:
+            updater_in_bundle = _resource_path("MiseAJour_macOS_Et_Relance.sh")
+            if not os.path.exists(updater_in_bundle):
+                messagebox.showerror(APP_TITLE, f"Script de mise à jour macOS introuvable:\n{updater}")
+                return
+        else:
+            bat = os.path.join(APP_DIR, "MiseAJour_Zip_Et_Relance.bat")
+            if not os.path.exists(bat):
+                messagebox.showerror(APP_TITLE, f"Script de mise à jour introuvable:\n{bat}")
+                return
         if not messagebox.askyesno(
             APP_TITLE,
             "L'application va se fermer, télécharger les mises à jour, puis se relancer.\n\nContinuer ?",
@@ -2956,14 +2981,40 @@ class AthleteApp(tk.Tk):
             ui_py = os.path.join(APP_DIR, "update_ui.py")
             if os.path.exists(ui_py):
                 subprocess.Popen([sys.executable, ui_py], cwd=APP_DIR, close_fds=True)
-            # Run updater without opening a cmd window for client.
-            no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-            subprocess.Popen(
-                ["cmd.exe", "/c", bat],
-                cwd=APP_DIR,
-                close_fds=True,
-                creationflags=no_window,
-            )
+            if is_macos:
+                app_bundle = self._find_macos_app_bundle_path()
+                if not app_bundle:
+                    messagebox.showerror(
+                        APP_TITLE,
+                        "Impossible de détecter le bundle .app.\n"
+                        "La mise à jour macOS nécessite une application packagée (.app).",
+                    )
+                    return
+                # Copy updater to a writable temp location (PyInstaller bundle can be read-only).
+                tmp_dir = tempfile.mkdtemp(prefix="athletes_upd_")
+                updater_tmp = os.path.join(tmp_dir, "MiseAJour_macOS_Et_Relance.sh")
+                shutil.copy2(updater_in_bundle, updater_tmp)
+                try:
+                    os.chmod(updater_tmp, os.stat(updater_tmp).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+                except Exception:
+                    pass
+                subprocess.Popen(
+                    ["/bin/bash", updater_tmp, app_bundle],
+                    cwd=APP_DIR,
+                    close_fds=True,
+                )
+            elif is_windows:
+                # Run updater without opening a cmd window for client.
+                no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+                subprocess.Popen(
+                    ["cmd.exe", "/c", bat],
+                    cwd=APP_DIR,
+                    close_fds=True,
+                    creationflags=no_window,
+                )
+            else:
+                messagebox.showerror(APP_TITLE, f"OS non supporté pour la MAJ: {platform.platform()}")
+                return
         except Exception as e:
             messagebox.showerror(APP_TITLE, f"Impossible de lancer la mise à jour:\n{e}")
             return
@@ -2973,6 +3024,26 @@ class AthleteApp(tk.Tk):
             self.destroy()
         except Exception:
             sys.exit(0)
+
+    def _find_macos_app_bundle_path(self) -> Optional[str]:
+        """
+        When packaged as a macOS .app (e.g. PyInstaller), sys.executable typically looks like:
+        /.../Athletes Searcher.app/Contents/MacOS/Athletes Searcher
+        We climb up until we find a path ending with .app.
+        """
+        try:
+            exe = os.path.abspath(sys.executable or "")
+            p = exe
+            for _ in range(10):
+                if p.lower().endswith(".app") and os.path.isdir(p):
+                    return p
+                p2 = os.path.dirname(p)
+                if p2 == p:
+                    break
+                p = p2
+        except Exception:
+            return None
+        return None
 
     def _split_name(self, full_name: str) -> (str, str):
         if not full_name:
