@@ -1295,17 +1295,19 @@ class AthleteApp(tk.Tk):
         ttk.Button(actions_row, text="-", width=3, command=self.on_delete_selected_rows).grid(
             row=0, column=6, padx=4, sticky="w"
         )
+        # Stretch spacer so logs/IG/update controls stay aligned on the far right.
+        actions_row.columnconfigure(7, weight=1)
         self.toggle_logs_btn = ttk.Button(actions_row, text="Afficher logs", command=self._toggle_logs)
-        self.toggle_logs_btn.grid(row=0, column=8, padx=10, sticky="w")
+        self.toggle_logs_btn.grid(row=0, column=8, padx=10, sticky="e")
         self.ig_mode_check = ttk.Checkbutton(
             actions_row,
             text="Mode IG rapide",
             variable=self._ig_fast_mode_var,
         )
-        self.ig_mode_check.grid(row=0, column=9, padx=6, sticky="w")
+        self.ig_mode_check.grid(row=0, column=9, padx=6, sticky="e")
 
         ttk.Button(actions_row, text="Mise à jour", command=self.on_update_app).grid(
-            row=0, column=10, padx=6, sticky="w"
+            row=0, column=10, padx=6, sticky="e"
         )
 
         # Stabilize form layout so input fields remain visible.
