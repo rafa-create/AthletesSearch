@@ -1,16 +1,19 @@
 @echo off
 setlocal EnableDelayedExpansion
-cd /d "%~dp0"
+
+rem Project root (so build/dist/release are created alongside the root launcher).
+cd /d "%~dp0.."
+
 set "PYTHON_EXE=D:\Pythons\Python3.11.4Global\python.exe"
-set "BUILD_VENV=.buildvenv"
+set "BUILD_VENV=app\.buildvenv"
 
 rem Mode rapide par defaut (venv + cache PyInstaller conserves).
 rem Build complet lent: set CLEAN_BUILD=1 avant de lancer ce script.
-rem Exemple: set CLEAN_BUILD=1 && build_onedir.bat
+rem Exemple: set CLEAN_BUILD=1 && app\build_onedir.bat
 
 if not exist "%PYTHON_EXE%" (
   echo Python 3.11 introuvable: "%PYTHON_EXE%"
-  echo Modifiez PYTHON_EXE dans build_onedir.bat puis relancez.
+  echo Modifiez PYTHON_EXE dans app\build_onedir.bat puis relancez.
   pause
   exit /b 1
 )
@@ -38,7 +41,7 @@ if not exist "%BUILD_VENV%\Scripts\python.exe" (
 echo [3/5] Installation des dependances ^(venv^)...
 call "%BUILD_VENV%\Scripts\python.exe" -m pip install --upgrade pip -q
 call "%BUILD_VENV%\Scripts\python.exe" -m pip install "numpy<2" -q
-call "%BUILD_VENV%\Scripts\python.exe" -m pip install -r requirements.txt -q
+call "%BUILD_VENV%\Scripts\python.exe" -m pip install -r app\requirements.txt -q
 call "%BUILD_VENV%\Scripts\python.exe" -m pip install pyinstaller -q
 
 echo [4/5] Build ^(onedir^)...
@@ -58,7 +61,7 @@ call "%BUILD_VENV%\Scripts\python.exe" -m PyInstaller !PI_OPTS! ^
   --exclude-module PySide6 ^
   --exclude-module shiboken6 ^
   --exclude-module matplotlib ^
-  app.py
+  app\app.py
 
 if errorlevel 1 (
   echo Echec PyInstaller.
@@ -89,6 +92,7 @@ echo.
 if "%CLEAN_BUILD%"=="1" (
   echo Prochain build: sans variable CLEAN_BUILD = mode rapide ^(incremental^).
 ) else (
-  echo Build lent ou bizarre? relancez avec: set CLEAN_BUILD=1 ^&^& build_onedir.bat
+  echo Build lent ou bizarre? relancez avec: set CLEAN_BUILD=1 ^&^& app\build_onedir.bat
 )
 pause
+

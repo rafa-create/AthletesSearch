@@ -1,0 +1,10 @@
+requests
+ddgs
+beautifulsoup4
+pandas
+selenium
+webdriver-manager
+fake-useragent
+tenacity
+rich
+loguru

@@ -5,8 +5,9 @@
       "name": "Run Athletes Searcher (.buildvenv)",
       "type": "debugpy",
       "request": "launch",
-      "python": "${workspaceFolder}\\.buildvenv\\Scripts\\python.exe",
-      "program": "${workspaceFolder}/app.py",
+      "python": "${workspaceFolder}\\app\\.buildvenv\\Scripts\\python.exe",
+      "program": "${workspaceFolder}\\app\\app.py",
+      "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
       "justMyCode": true
     }

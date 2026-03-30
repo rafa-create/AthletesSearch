@@ -2,6 +2,10 @@
 setlocal
 cd /d "%~dp0"
 
+rem Root of the delivery (CSV/logs created there)
+set "ATHLETES_ROOT=%CD%\.."
+
+rem Use app/.buildvenv and app/app.py
 set "PY_EXE=%CD%\.buildvenv\Scripts\python.exe"
 set "APP_FILE=%CD%\app.py"
 
@@ -29,3 +33,4 @@ if not "%EXIT_CODE%"=="0" (
 )
 
 exit /b %EXIT_CODE%
+
