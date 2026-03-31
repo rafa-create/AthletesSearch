@@ -3415,6 +3415,14 @@ class AthleteApp(tk.Tk):
                         )
                     except Exception as ex:
                         append_log(f"[IG] {name}: complément auth échec: {ex}")
+                # Compléter abonnés/posts via SERP si nécessaire (nom + instagram [+ club]),
+                # y compris quand le handle vient de Wikidata.
+                if out.get("followers") is None or out.get("posts") is None:
+                    gs, gp = self._serp_google_stats_for_handle(name, club_hint or "", out.get("instagram"))
+                    if gs is not None:
+                        out["followers"] = gs
+                    if gp is not None:
+                        out["posts"] = gp
                 if out.get("followers") is None and out.get("posts") is None:
                     append_log(
                         f"[IG] {name}: posts_90j=None: mode Rapide — aucun appel get_profile "
