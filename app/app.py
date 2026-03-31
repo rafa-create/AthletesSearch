@@ -620,9 +620,18 @@ def is_likely_player_name_for_roster(name: str) -> bool:
         return False
     lower = n.lower()
     blocked_tokens = [
-        "fc", "cf", "ac", "sc", "inter", "bayern", "sporting", "eintracht", "saint-germain",
-        "paris", "milan", "frankfurt", "são paulo", "sao paulo", "loan", "captain", "manager",
-        "coach", "league", "cup", "women", "youth", "reserve", "academy",
+        # Mots-clés non "personne" (clubs/compétitions/structures)
+        "fc", "cf", "ac", "sc", "as", "us", "rc", "cr", "af", "sk", "ksv",
+        "united", "city", "real", "sociedad", "olympique", "club", "benfica",
+        "tottenham", "flamengo", "roma", "liga", "ligue", "super", "süper",
+        "inter", "bayern", "sporting", "eintracht", "saint-germain",
+        "paris", "milan", "frankfurt", "são paulo", "sao paulo",
+        "loan", "captain", "manager", "coach", "league", "cup",
+        "women", "youth", "reserve", "academy",
+        # Bruit de navigation / pages non-joueurs
+        "télécharger", "telecharger", "programme", "live", "infos",
+        "archives", "application", "mobile", "calendrier", "photos", "videos", "vidéos",
+        "mercato", "pdf", "calcio", "prêt", "pret", "vendée", "vendee", "oa",
     ]
     # Faux positifs fréquents (langues, Wikipédia) captés par la regex ou des tableaux hors effectif.
     blocked_first_word = {
@@ -633,6 +642,11 @@ def is_likely_player_name_for_roster(name: str) -> bool:
     if first_w in blocked_first_word:
         return False
     if any(tok in lower for tok in blocked_tokens):
+        return False
+    # Rejette les intitulés commençant par un sigle court tout en majuscules
+    # (AS Roma, RC Lens, US Tours, KAS Eupen, etc.).
+    first_token = (n.split()[0] if n.split() else "").strip(".,;:()")
+    if re.fullmatch(r"[A-Z]{2,4}", first_token or ""):
         return False
     if not re.match(r"^[A-ZÀ-Ý][A-Za-zÀ-ÿ'\-]+(?:\s+[A-ZÀ-Ý][A-Za-zÀ-ÿ'\-]+){1,2}$", n):
         return False
@@ -1319,6 +1333,125 @@ def discover_official_roster_url_ddgs(
 
 
 def official_site_extract_names_from_url(url: str, limit: int) -> List[str]:
+    # Cas particulier Wikipedia: utiliser l'extraction dédiée "tables d'effectif"
+    # (sections ciblées + mode strict) au lieu du parse générique HTML.
+    try:
+        pu = urlparse((url or "").strip())
+        host = (pu.netloc or "").lower()
+        path = (pu.path or "")
+        if "wikipedia.org" in host and "/wiki/" in path:
+            title = unquote(path.split("/wiki/", 1)[-1]).replace("_", " ").strip()
+            if title:
+                lang = "fr" if host.startswith("fr.") else ("en" if host.startswith("en.") else "fr")
+                section_hints = (
+                    WIKI_FR_ROSTER_SECTIONS_STRICT
+                    if lang == "fr"
+                    else ["Current squad", "First-team squad", "Squad", "Players"]
+                )
+                names = wikipedia_extract_names_from_page(
+                    title=title,
+                    limit=limit,
+                    section_hints=section_hints,
+                    lang=lang,
+                    strict_current_squad=True,
+                )
+                if names:
+                    return names
+                # If strict section extraction fails, retry in non-strict table mode,
+                # but still with Wikipedia-specific filters (no generic site parse fallback).
+                names = wikipedia_extract_names_from_page(
+                    title=title,
+                    limit=limit,
+                    section_hints=section_hints,
+                    lang=lang,
+                    strict_current_squad=False,
+                )
+                if names:
+                    return names
+
+                # Last-resort Wikipedia API section links:
+                # keep only links explicitly present in current-season squad section(s).
+                try:
+                    api = f"https://{lang}.wikipedia.org/w/api.php"
+                    headers = {
+                        "User-Agent": (UA.random if UA is not None else "AthletesSearcher/1.0"),
+                        "Accept": "application/json",
+                    }
+                    sec_resp = requests.get(
+                        api,
+                        params={
+                            "action": "parse",
+                            "page": title,
+                            "prop": "sections",
+                            "format": "json",
+                        },
+                        headers=headers,
+                        timeout=25,
+                    )
+                    sec_resp.raise_for_status()
+                    sec_data = sec_resp.json()
+                    sections = (((sec_data or {}).get("parse") or {}).get("sections") or [])
+                    wanted = []
+                    for s in sections:
+                        line = (s.get("line") or "").strip().lower()
+                        if any(
+                            k in line
+                            for k in (
+                                "effectif",
+                                "joueurs",
+                                "encadrement",
+                                "current squad",
+                                "first-team squad",
+                                "squad",
+                                "players",
+                            )
+                        ):
+                            idx = (s.get("index") or "").strip()
+                            if idx:
+                                wanted.append(idx)
+                    collected: List[str] = []
+                    seen_names: set = set()
+                    for idx in wanted:
+                        lr = requests.get(
+                            api,
+                            params={
+                                "action": "parse",
+                                "page": title,
+                                "prop": "text",
+                                "section": idx,
+                                "format": "json",
+                            },
+                            headers=headers,
+                            timeout=25,
+                        )
+                        lr.raise_for_status()
+                        ldata = lr.json()
+                        raw_html = ((((ldata or {}).get("parse") or {}).get("text") or {}).get("*") or "")
+                        if not raw_html or BeautifulSoup is None:
+                            continue
+                        sec_soup = BeautifulSoup(raw_html, "html.parser")
+                        # Parse all wiki links in the section HTML, then keep only human-like names.
+                        for a in sec_soup.select("a[href^='/wiki/']"):
+                            nm = (a.get_text() or "").strip()
+                            if not nm or ":" in nm:
+                                continue
+                            if not is_likely_player_name_for_roster(nm):
+                                continue
+                            k = nm.lower()
+                            if k in seen_names:
+                                continue
+                            seen_names.add(k)
+                            collected.append(nm)
+                            if len(collected) >= limit:
+                                break
+                        if len(collected) >= limit:
+                            break
+                    return collected
+                except Exception:
+                    return []
+    except Exception:
+        pass
+
     def _fetch():
         r = http_get(url, timeout=35)
         r.raise_for_status()
@@ -1562,6 +1695,10 @@ def wikipedia_extract_names_from_page(
             tables = [t for t in soup.select("table.wikitable") if _wikipedia_table_looks_like_squad(t)]
         from_section = bool(scoped_tables)
         for tbl in tables[:6]:
+            # Ignore transfer/loan/departure tables when we want current squad.
+            head_text = " ".join((th.get_text(" ", strip=True) or "").lower() for th in tbl.select("tr th")[:20])
+            if any(k in head_text for k in ("prêt", "pret", "transfert", "arrivée", "arrivee", "départ", "depart")):
+                continue
             if not from_section and not _wikipedia_table_looks_like_squad(tbl):
                 continue
             player_col_idx = None
@@ -1574,6 +1711,9 @@ def wikipedia_extract_names_from_page(
 
             rows = tbl.select("tr")
             for tr in rows:
+                row_text = (tr.get_text(" ", strip=True) or "").lower()
+                if any(k in row_text for k in ("prêt", "pret", "transfert", "arrivée", "arrivee", "départ", "depart")):
+                    continue
                 cells = tr.find_all(["th", "td"])
                 if not cells:
                     continue
