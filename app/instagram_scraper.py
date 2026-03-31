@@ -2,6 +2,7 @@ import json
 import random
 import re
 import time
+import datetime as dt
 
 import requests
 
@@ -10,10 +11,15 @@ try:
 except Exception:
     UserAgent = None
 
+try:
+    from instagrapi import Client as IGClient
+except Exception:
+    IGClient = None
+
 
 class InstagramScraper:
     """
-    Best-effort Instagram public scraper (no login).
+    Best-effort Instagram scraper.
 
     - Pas de cache disque : chaque get_profile refait un appel (tests et diagnostic fiables).
     - Rate-limit global (intervalle entre requêtes).
@@ -31,6 +37,8 @@ class InstagramScraper:
         self,
         allow_selenium_fallback: bool = True,
         logger_fn=None,
+        auth_username: str = "",
+        auth_password: str = "",
     ) -> None:
         self.allow_selenium_fallback = allow_selenium_fallback
         self._logger_fn = logger_fn
@@ -40,6 +48,16 @@ class InstagramScraper:
         self._degraded_until_by_user = {}
         self._last_json_status_by_user = {}
         self._fast_mode = False
+        self._auth_username = (auth_username or "").strip()
+        self._auth_password = (auth_password or "").strip()
+        self._ig_client = None
+        self._ig_logged_in = False
+
+    def set_credentials(self, username: str, password: str) -> None:
+        self._auth_username = (username or "").strip()
+        self._auth_password = (password or "").strip()
+        self._ig_client = None
+        self._ig_logged_in = False
 
     def set_fast_mode(self, enabled: bool) -> None:
         self._fast_mode = bool(enabled)
@@ -50,6 +68,79 @@ class InstagramScraper:
                 self._logger_fn(msg)
             except Exception:
                 pass
+
+    def has_auth_credentials(self) -> bool:
+        return bool(self._auth_username and self._auth_password and IGClient is not None)
+
+    def _ensure_auth_client(self) -> bool:
+        if self._ig_logged_in and self._ig_client is not None:
+            return True
+        if not self.has_auth_credentials():
+            return False
+        try:
+            self._log(f"[IG] login auth start @{self._auth_username}")
+            client = IGClient()
+            client.login(self._auth_username, self._auth_password)
+            self._ig_client = client
+            self._ig_logged_in = True
+            self._log(f"[IG] login auth OK @{self._auth_username}")
+            return True
+        except Exception as ex:
+            self._ig_client = None
+            self._ig_logged_in = False
+            self._log(f"[IG] login auth KO: {ex}")
+            return False
+
+    def _auth_get_profile(self, username: str) -> dict | None:
+        if not self._ensure_auth_client():
+            return None
+        try:
+            u = username.strip().lstrip("@")
+            user = self._ig_client.user_info_by_username(u)
+            followers = getattr(user, "follower_count", None)
+            posts = getattr(user, "media_count", None)
+            bio = (getattr(user, "biography", "") or "").strip() or None
+
+            posts_last_90d = None
+            try:
+                cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=90)
+                medias = self._ig_client.user_medias(user.pk, amount=50)
+                cnt = 0
+                for media in medias:
+                    taken_at = getattr(media, "taken_at", None)
+                    if taken_at is None:
+                        continue
+                    t = taken_at if taken_at.tzinfo else taken_at.replace(tzinfo=dt.timezone.utc)
+                    if t >= cutoff:
+                        cnt += 1
+                    else:
+                        break
+                posts_last_90d = cnt
+            except Exception:
+                posts_last_90d = None
+
+            out = {
+                "username": u,
+                "followers": int(followers) if isinstance(followers, int) else None,
+                "posts": int(posts) if isinstance(posts, int) else None,
+                "bio": bio,
+                "posts_last_90d": posts_last_90d,
+            }
+            bio_note = ""
+            if bio:
+                snippet = bio.replace("\n", " ").strip()
+                if len(snippet) > 90:
+                    snippet = snippet[:90] + "…"
+                bio_note = f" bio_preview={snippet!r}"
+            self._log(
+                f"[IG] @{u} auth parsed followers={out.get('followers')} "
+                f"posts={out.get('posts')} posts_90j={out.get('posts_last_90d')} "
+                f"bio={'yes' if out.get('bio') else 'no'}{bio_note}"
+            )
+            return out
+        except Exception as ex:
+            self._log(f"[IG] @{username} auth fetch KO: {ex}")
+            return None
 
     def _random_ua(self) -> str:
         if self._ua is not None:
@@ -351,6 +442,10 @@ class InstagramScraper:
         u = (username or "").strip().lstrip("@")
         if not u:
             return {"username": "", "followers": None, "posts": None, "bio": None, "posts_last_90d": None}
+
+        auth_data = self._auth_get_profile(u)
+        if auth_data is not None:
+            return auth_data
 
         # Fast-fail window when Instagram public surface is temporarily unusable for this handle.
         now = time.time()

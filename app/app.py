@@ -96,7 +96,9 @@ def _macos_updater_script_path() -> Optional[str]:
     return None
 
 
-# Instagram login removed (web-only)
+# Instagram auth defaults (override with env IG_USER / IG_PASS).
+IG_DEFAULT_USER = "pogo.loc"
+IG_DEFAULT_PASS = "Pogo54500/"
 DEFAULT_SPORT = "foot"
 DEFAULT_VILLE = "paris"
 DEFAULT_CLUB = "psg"
@@ -217,6 +219,69 @@ def calc_age(birth_date_str: str) -> str:
     return ""
 
 
+def _days_in_month(year: int, month: int) -> int:
+    # month: 1..12
+    if month == 12:
+        nxt = dt.date(year + 1, 1, 1)
+    else:
+        nxt = dt.date(year, month + 1, 1)
+    cur = dt.date(year, month, 1)
+    return (nxt - cur).days
+
+
+def _add_months(d: dt.date, months: int) -> dt.date:
+    y = d.year + (d.month - 1 + months) // 12
+    m = (d.month - 1 + months) % 12 + 1
+    day = min(d.day, _days_in_month(y, m))
+    return dt.date(y, m, day)
+
+
+def calc_age_ymd(birth_date_str: str, *, today: Optional[dt.date] = None) -> Optional[Tuple[int, int, int]]:
+    """Return (years, months, days) between birth date and today."""
+    if not birth_date_str:
+        return None
+    t = today or dt.date.today()
+    born = None
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            born = dt.datetime.strptime(birth_date_str.strip(), fmt).date()
+            break
+        except ValueError:
+            continue
+    if born is None or born > t:
+        return None
+
+    years = t.year - born.year
+    try:
+        anchor = dt.date(born.year + years, born.month, min(born.day, _days_in_month(born.year + years, born.month)))
+    except Exception:
+        return None
+    if anchor > t:
+        years -= 1
+        anchor = dt.date(born.year + years, born.month, min(born.day, _days_in_month(born.year + years, born.month)))
+
+    months = 0
+    while True:
+        nxt = _add_months(anchor, months + 1)
+        if nxt <= t:
+            months += 1
+        else:
+            break
+        if months >= 12:
+            break
+    anchor2 = _add_months(anchor, months)
+    days = (t - anchor2).days
+    return years, months, days
+
+
+def calc_age_human(birth_date_str: str) -> str:
+    ymd = calc_age_ymd(birth_date_str)
+    if not ymd:
+        return ""
+    y, m, d = ymd
+    return f"{y} ans, {m} mois, {d} jours"
+
+
 def count_recent_posts(post_dates: List[dt.datetime]) -> int:
     cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=90)
     return sum(1 for d in post_dates if d >= cutoff)
@@ -277,11 +342,18 @@ _NET_LAST_TS = {"wikipedia": 0.0, "wikidata": 0.0, "instagram": 0.0}
 _WIKIPEDIA_TITLE_CACHE: Dict[str, Optional[str]] = {}
 # Set during an active search so Wikipedia/Wikidata waits can be interrupted on cancel.
 _search_cancel_event_ref: Optional[threading.Event] = None
+# Google SERP HTTP: si 429, mettre en pause un moment pour éviter de spammer.
+_GOOGLE_COOLDOWN_UNTIL: float = 0.0
 
 
 def bind_search_cancel_event(ev: Optional[threading.Event]) -> None:
     global _search_cancel_event_ref
     _search_cancel_event_ref = ev
+
+
+def _raise_if_cancelled_global() -> None:
+    if _search_cancel_event_ref is not None and _search_cancel_event_ref.is_set():
+        raise SearchCancelled("Recherche annulée.")
 
 
 def _sleep_interruptible(seconds: float) -> None:
@@ -794,6 +866,17 @@ def _score_roster_candidate_url(
             if len(t) >= 3:
                 tokens.append(t)
     txt = f"{netloc} {path}"
+    # Sigles courts (ex "RCC") : si une ville est fournie, on exige au moins un token ville,
+    # sinon on risque de tomber sur un autre club homonyme.
+    club_clean = "".join(re.findall(r"[A-Za-z0-9]+", (club_hint or "").strip()))
+    if club_clean and len(club_clean) <= 4 and (ville_hint or "").strip():
+        ville_tokens = [
+            t
+            for t in re.findall(r"[A-Za-zÀ-ÿ0-9]+", (ville_hint or "").lower())
+            if len(t) >= 3
+        ]
+        if ville_tokens and not any(vt in txt for vt in ville_tokens):
+            score -= 140
     if tokens:
         if any(t in txt for t in tokens):
             score += 35
@@ -891,6 +974,7 @@ def _google_serp_html_for_query(query: str) -> str:
 
 def _ddg_text_blob_for_birth_query(query: str) -> str:
     """Titres + extraits DuckDuckGo (évite dépendre uniquement de Google, ex. HTTP 429)."""
+    _raise_if_cancelled_global()
     try:
         from ddgs import DDGS
     except Exception:
@@ -905,6 +989,7 @@ def _ddg_text_blob_for_birth_query(query: str) -> str:
         return ""
     parts: List[str] = []
     for r in rows:
+        _raise_if_cancelled_global()
         parts.append(
             " ".join(
                 x
@@ -1003,6 +1088,7 @@ def serp_guess_birth_date(
     nm = (name or "").strip()
     if len(nm) < 3:
         return None
+    append_log(f"{nm}: recherche date de naissance (web)…", step=True)
     ch = (club_hint or "").strip()
     sp = (sport_hint or "").strip()
     vh = (ville_hint or "").strip()
@@ -1029,6 +1115,7 @@ def serp_guess_birth_date(
         queries.extend([f'"{nm}" {sp} né', f'"{nm}" {sp} date de naissance'])
     seen: set = set()
     for q in queries:
+        _raise_if_cancelled_global()
         q = q.strip()
         if not q or q in seen:
             continue
@@ -1044,7 +1131,9 @@ def serp_guess_birth_date(
             plain = (plain + " " + _ddg_text_blob_for_birth_query(q)).strip()
         bd = _best_birth_date_from_plain_text(plain)
         if bd:
+            append_log(f"{nm}: date de naissance (web) {bd}", step=True)
             return bd
+    append_log(f"{nm}: date de naissance (web) introuvable", step=True)
     return None
 
 
@@ -1087,6 +1176,7 @@ def discover_official_roster_url_google_http(
     Same idea as typing in Google: « nom du club effectif » (HTTP SERP, no Selenium).
     Agrège les liens de toutes les requêtes puis choisit le meilleur score (masculin vs féminin).
     """
+    global _GOOGLE_COOLDOWN_UNTIL
     club = (club or "").strip()
     if not club:
         return None
@@ -1111,7 +1201,12 @@ def discover_official_roster_url_google_http(
         "Referer": "https://www.google.com/",
     }
     all_urls: List[str] = []
+    now_ts = time.time()
+    if _GOOGLE_COOLDOWN_UNTIL and now_ts < _GOOGLE_COOLDOWN_UNTIL:
+        append_log(f"Google (effectif): cooldown actif ({int(_GOOGLE_COOLDOWN_UNTIL - now_ts)}s)", step=True)
+        return None
     for q in queries:
+        _raise_if_cancelled_global()
         if not q.strip():
             continue
         url = f"https://www.google.com/search?hl=fr&num=20&q={quote_plus(q)}"
@@ -1120,18 +1215,17 @@ def discover_official_roster_url_google_http(
             resp = requests.get(url, headers=headers, timeout=20)
             if resp.status_code >= 400:
                 append_log(f"Google (effectif): HTTP {resp.status_code}", step=True)
+                if resp.status_code == 429:
+                    # Evite 3 requêtes inutiles + risque de blocage plus long.
+                    _GOOGLE_COOLDOWN_UNTIL = time.time() + 60.0
+                    break
                 continue
             all_urls.extend(_extract_urls_from_google_serp_html(resp.text or ""))
         except Exception as ex:
             append_log(f"Google (effectif): erreur ({ex})", step=True)
             continue
-    picked = _pick_roster_page_url(
-        _dedupe_urls_preserve_order(all_urls),
-        prefer_feminine=prefer_feminine,
-        club_hint=club,
-        ville_hint=ville,
-        sport_hint=sport,
-    )
+    urls = _dedupe_urls_preserve_order(all_urls)
+    picked = urls[0] if urls else None
     if picked:
         append_log(f"Google (effectif): URL retenue {picked}", step=True)
     return picked
@@ -1168,13 +1262,8 @@ def discover_official_roster_url_ddgs(
         except Exception:
             continue
         all_hrefs.extend([(r.get("href") or "").strip() for r in rows if r])
-    picked = _pick_roster_page_url(
-        _dedupe_urls_preserve_order(all_hrefs),
-        prefer_feminine=prefer_feminine,
-        club_hint=club,
-        ville_hint=ville,
-        sport_hint=sport,
-    )
+    hrefs = _dedupe_urls_preserve_order(all_hrefs)
+    picked = hrefs[0] if hrefs else None
     if picked:
         append_log(f"DDGS (effectif): URL retenue {picked}", step=True)
     return picked
@@ -1515,7 +1604,7 @@ def wikipedia_resolve_wikidata_qid(name: str, club_hint: str = "") -> Optional[s
         return r.json()
 
     try:
-        data = RETRY.run(f"Wikipedia search {nm}", _search)
+        data = RETRY.run(f"Wikipedia search (qid) {nm}", _search)
         hits = (((data or {}).get("query") or {}).get("search") or [])
         if not hits:
             return None
@@ -1997,6 +2086,8 @@ class AthleteApp(tk.Tk):
         self._search_progress_retained = 0
         self._search_cancel_event: Optional[threading.Event] = None
         self._search_cancel_requested = False
+        self._search_in_progress = False
+        self._autosave_dirty_during_search = False
         self._active_busy_dialog: Optional[BusyDialog] = None
         self._instagram_prompt_done = False
         self._instagram_public_ok: Optional[bool] = None
@@ -2008,9 +2099,13 @@ class AthleteApp(tk.Tk):
         self._ig_scraper = None
         if InstagramScraper is not None:
             try:
+                ig_user = (os.getenv("IG_USER", "") or "").strip() or IG_DEFAULT_USER
+                ig_pass = (os.getenv("IG_PASS", "") or "").strip() or IG_DEFAULT_PASS
                 self._ig_scraper = InstagramScraper(
                     allow_selenium_fallback=True,
                     logger_fn=append_log,
+                    auth_username=ig_user,
+                    auth_password=ig_pass,
                 )
             except Exception:
                 self._ig_scraper = None
@@ -2076,26 +2171,32 @@ class AthleteApp(tk.Tk):
 
     def _init_instagram_public_non_blocking(self) -> None:
         """
-        Initialize "Instagram public" access at startup (no login).
+        Initialize Instagram access at startup (auth if possible, else public).
         This updates the right-side status and allows the user to re-run via button.
         """
         try:
-            self.after(0, lambda: self._set_status("Initialisation Instagram (mode public)…"))
+            self.after(0, lambda: self._set_status("Initialisation Instagram (auth/public)…"))
             append_log(
                 f"[IG] mode résolution handles: {'rapide (DDG)' if self._ig_ui_is_fast_mode() else 'complet (Google+DDG+Selenium)'}"
             )
             ok = False
             if self._ig_scraper is not None:
-                ok = bool(self._ig_scraper.probe())
+                if self._ig_scraper.has_auth_credentials():
+                    ok = bool(self._ig_scraper._ensure_auth_client())
+                    if ok:
+                        self._instagram_public_message = "Instagram: OK (auth)"
+                if not ok:
+                    ok = bool(self._ig_scraper.probe())
             else:
                 # Probe a stable public profile page (legacy lightweight probe)
                 probe = instagram_public_scrape("https://www.instagram.com/instagram")
                 ok = (probe.get("followers") is not None) or (probe.get("posts") is not None) or bool(probe.get("bio"))
             self._instagram_public_ok = bool(ok)
-            if self._instagram_public_ok:
+            if self._instagram_public_ok and not self._instagram_public_message.endswith("(auth)"):
                 self._instagram_public_message = "Instagram: OK (public)"
             else:
-                self._instagram_public_message = "Instagram: limité (public)"
+                if not self._instagram_public_message.endswith("(auth)"):
+                    self._instagram_public_message = "Instagram: limité (public)"
         except Exception:
             self._instagram_public_ok = False
             self._instagram_public_message = "Instagram: limité (public)"
@@ -2373,6 +2474,8 @@ class AthleteApp(tk.Tk):
         if not filters:
             return
         start_search_log_timing()
+        self._search_in_progress = True
+        self._autosave_dirty_during_search = False
         # Freeze IG mode for the whole search run to avoid mid-run toggles/inconsistent logs.
         self._ig_fast_mode_current = self._ig_ui_is_fast_mode()
         append_log(
@@ -2458,6 +2561,12 @@ class AthleteApp(tk.Tk):
             # Après les autres after(0) du try/except (statut, autosave) pour garder le chrono actif.
             self.after(0, self._close_search_dialog)
             self.after(0, lambda: self.search_btn.configure(state="normal"))
+            # Si l'utilisateur a modifié une ligne pendant la recherche, on persiste une fois à la fin.
+            if self._autosave_dirty_during_search:
+                self.after(0, lambda: self._autosave_csv(self._current_search_text() or "manuel", timing_step=True))
+                self.after(0, lambda: self._build_final_results_from_table())
+                self._autosave_dirty_during_search = False
+            self._search_in_progress = False
             self.after(0, stop_search_log_timing)
 
     def _search_wikidata_roster(self, filters: SearchFilters) -> List[Dict[str, str]]:
@@ -2618,7 +2727,7 @@ class AthleteApp(tk.Tk):
                         )
                         if ps.get("birth_date"):
                             row["Date de naissance"] = ps["birth_date"]
-                            row["Age"] = str(ps.get("age") or "")
+                            row["Age"] = calc_age_human(ps["birth_date"]) or str(ps.get("age") or "")
                         if ps.get("nationality"):
                             row["Nationalité"] = ps["nationality"]
                         if ps.get("bio"):
@@ -2663,7 +2772,7 @@ class AthleteApp(tk.Tk):
             row["Club"] = club
             row["Ville"] = ville
             row["Date de naissance"] = p.get("birth_date") or ""
-            row["Age"] = calc_age(row["Date de naissance"]) if row["Date de naissance"] else ""
+            row["Age"] = calc_age_human(row["Date de naissance"]) if row["Date de naissance"] else ""
             row["Nationalité"] = p.get("nationality") or ""
             row["Instagram"] = (f"https://instagram.com/{ig[1:]}" if ig and ig.startswith("@") else (ig or ""))
             row["Info en bio"] = ""
@@ -3005,7 +3114,7 @@ class AthleteApp(tk.Tk):
                 # Apply structured fields back to CSV row
                 if player_struct.get("birth_date"):
                     row["Date de naissance"] = player_struct["birth_date"]
-                    row["Age"] = str(player_struct.get("age") or "")
+                    row["Age"] = calc_age_human(player_struct["birth_date"]) or str(player_struct.get("age") or "")
                 if player_struct.get("nationality"):
                     row["Nationalité"] = player_struct["nationality"]
                 if player_struct.get("bio"):
@@ -3147,7 +3256,6 @@ class AthleteApp(tk.Tk):
                         out["age"] = int(calc_age(bd_web) or 0) or None
                     except Exception:
                         out["age"] = None
-                    append_log(f"{name}: date de naissance (extrait recherche web) {bd_web}")
             except Exception:
                 pass
 
@@ -3227,17 +3335,43 @@ class AthleteApp(tk.Tk):
             if not ig_url:
                 append_log(f"[IG] {name}: scraping ignoré (pas d'URL instagram)")
             elif self._ig_fast_mode_current:
-                append_log(f"[IG] {name}: mode rapide, scraping Instagram désactivé (handle conservé)")
+                append_log(f"[IG] {name}: mode rapide, scraping public désactivé (handle conservé)")
+                # Avec identifiants Instagram : complément léger (bio, posts 90j) via API auth,
+                # sans écraser abonnés/posts déjà issus du SERP.
+                if (
+                    self._ig_scraper is not None
+                    and getattr(self._ig_scraper, "has_auth_credentials", lambda: False)()
+                    and ig_url
+                ):
+                    try:
+                        uname = ig_url.rstrip("/").split("/")[-1]
+                        append_log(f"[IG] {name}: complément auth (bio / posts 90j) @{uname}")
+                        ig_data = self._ig_scraper.get_profile(uname, force_refresh=True)
+                        if ig_data.get("bio"):
+                            out["bio"] = ig_data["bio"]
+                        if ig_data.get("posts_last_90d") is not None:
+                            out["posts_last_90d"] = ig_data["posts_last_90d"]
+                        if out.get("followers") is None and ig_data.get("followers") is not None:
+                            out["followers"] = ig_data["followers"]
+                        if out.get("posts") is None and ig_data.get("posts") is not None:
+                            out["posts"] = ig_data["posts"]
+                        append_log(
+                            f"[IG] {name}: auth complété bio={'oui' if out.get('bio') else 'non'} "
+                            f"posts_90j={out.get('posts_last_90d')}"
+                        )
+                    except Exception as ex:
+                        append_log(f"[IG] {name}: complément auth échec: {ex}")
                 if out.get("followers") is None and out.get("posts") is None:
                     append_log(
                         f"[IG] {name}: posts_90j=None: mode Rapide — aucun appel get_profile "
                         f"(posts 3 mois indisponible sans scrape; « Complet » pour tenter)"
                     )
                 else:
-                    append_log(
-                        f"[IG] {name}: posts_90j=None: mode Rapide — abonnés/posts viennent de l’extrait SERP "
-                        f"(pas de posts sur 90 jours sans API/HTML profil)"
-                    )
+                    if out.get("posts_last_90d") is None:
+                        append_log(
+                            f"[IG] {name}: posts_90j=None: mode Rapide — abonnés/posts viennent de l’extrait SERP "
+                            f"(pas de posts sur 90 jours sans API/HTML profil)"
+                        )
             else:
                 append_log(f"[IG] {name}: scraping {ig_url}")
                 if self._ig_scraper is not None:
@@ -3751,6 +3885,29 @@ class AthleteApp(tk.Tk):
         Nombre d’abonnés depuis un extrait SERP. Priorité aux formulations FR (évite « 1M Followers »
         quand « Plus de 1,2 M abonnés » est présent) et aux « 935,9 k abonnés » sans « Plus de ».
         """
+        def _parse_word_suffix_num(num_raw: str, word_suffix: str) -> Optional[int]:
+            try:
+                s = (num_raw or "").strip().replace("\u202f", "").replace(" ", "")
+                # 123,8 -> 123.8 ; 123.456 -> 123456 (si entier de milliers)
+                if "," in s and "." not in s:
+                    if s.count(",") == 1 and len(s.split(",")[-1]) <= 2:
+                        s = s.replace(",", ".")
+                    else:
+                        s = s.replace(",", "")
+                if "." in s and s.count(".") == 1 and len(s.split(".")[-1]) == 3:
+                    s = s.replace(".", "")
+                n = float(s)
+                w = (word_suffix or "").lower()
+                if w.startswith("mil") and "milliard" not in w:
+                    return int(n * 1_000_000)
+                if w.startswith("milliard") or w.startswith("bill"):
+                    return int(n * 1_000_000_000)
+                if w.startswith("thousand"):
+                    return int(n * 1_000)
+                return int(n)
+            except Exception:
+                return None
+
         # A) « Plus de … M/k » + abonnés / followers (y compris « abonnes » sans accent API)
         p_plus = re.compile(
             r"(?is)plus\s+de\s+([\d][\d\s,\.]*)\s*([kKmM])\s*(?:abonnés|abonn[eè]s|abonnes|followers)\b",
@@ -3785,6 +3942,28 @@ class AthleteApp(tk.Tk):
                 return dec[0][2]
             abo_matches.sort(key=lambda x: x[0])
             return abo_matches[0][2]
+        # B2) FR/EN en mots : "123,8 millions d'abonnés", "500 million followers"
+        p_words = re.compile(
+            r"(?is)([\d][\d\s,\.]*)\s*(millions?|milliards?|thousands?|billions?)\s*(?:d['’]\s*)?(?:abonnés|abonn[eè]s|abonnes|followers)\b",
+        )
+        w_matches: List[Tuple[int, int]] = []
+        for m in p_words.finditer(t):
+            v = _parse_word_suffix_num(m.group(1), m.group(2))
+            if v is not None:
+                w_matches.append((m.start(), v))
+        if w_matches:
+            w_matches.sort(key=lambda x: x[0])
+            return w_matches[0][1]
+        # B3) Entier brut: "121 345 678 followers" / "84 000 abonnés"
+        p_plain = re.compile(r"(?is)([\d][\d\s\.,]{2,})\s*(?:abonnés|abonn[eè]s|abonnes|followers)\b")
+        plain_matches: List[Tuple[int, int]] = []
+        for m in p_plain.finditer(t):
+            v = _parse_int_maybe(m.group(1))
+            if v is not None and v >= 1000:
+                plain_matches.append((m.start(), v))
+        if plain_matches:
+            plain_matches.sort(key=lambda x: x[0])
+            return plain_matches[0][1]
         # C) Anglais : tous les « … Followers », préférer un nombre à décimal (1.2M) à un entier arrondi (1M)
         p_en = re.compile(r"(?is)([\d][\d\s,\.]*)\s*([kKmM])\s+Followers\b")
         en_cands: List[Tuple[bool, int, int]] = []
@@ -3814,6 +3993,7 @@ class AthleteApp(tk.Tk):
             r"([\d][\d\s,\.]*)[\s]*([kKmM])[\s]*(?:posts|publications)\b",
             r"([\d][\d\s,\.]*)[\s]*([kKmM])?[\s]*(?:posts|publications)\b",
             r"·\s*([\d][\d\s,\.]*)[\s]*([kKmM])?[\s]*(?:posts|publications)\b",
+            r"([\d][\d\s,\.]*)\s*(?:posts|publications)\b",
         ):
             pm = re.search(pat, t, re.IGNORECASE)
             if pm:
@@ -3857,26 +4037,75 @@ class AthleteApp(tk.Tk):
         try:
             resp = requests.get(url, headers=headers, timeout=18)
             if resp.status_code >= 400:
-                return None, None
-            plain = self._html_to_serp_plain(resp.text or "")
-            if not plain:
-                return None, None
-            if u:
-                for needle in (
-                    f"@{u}",
-                    f"instagram.com/{u}",
-                    f"instagram.com/{u}/",
-                    f"({u})",
-                ):
-                    idx = plain.lower().find(needle.lower())
-                    if idx >= 0:
-                        window = plain[max(0, idx - 900) : idx + 1400]
-                        fw, pw = self._parse_instagram_serp_stats(window)
-                        if fw is not None or pw is not None:
-                            return fw, pw
-            return self._parse_instagram_serp_stats(plain)
+                plain = ""
+            else:
+                plain = self._html_to_serp_plain(resp.text or "")
+            if plain:
+                if u:
+                    # Si on connaît le handle, on ne fait confiance qu'aux stats
+                    # trouvées dans une fenêtre de texte où ce handle apparaît.
+                    for needle in (
+                        f"@{u}",
+                        f"instagram.com/{u}",
+                        f"instagram.com/{u}/",
+                        f"({u})",
+                    ):
+                        idx = plain.lower().find(needle.lower())
+                        if idx >= 0:
+                            window = plain[max(0, idx - 900) : idx + 1400]
+                            fw, pw = self._parse_instagram_serp_stats(window)
+                            if fw is not None or pw is not None:
+                                return fw, pw
+                    # Handle connu mais aucune fenêtre avec ce handle → on ne prend PAS
+                    # de stats « génériques » (risque de tomber sur le compte du club).
+                else:
+                    fw, pw = self._parse_instagram_serp_stats(plain)
+                    if fw is not None or pw is not None:
+                        return fw, pw
         except Exception:
-            return None, None
+            pass
+
+        # Fallback DDG HTML (quand Google est vide/limité), en gardant la même stratégie autour du handle.
+        try:
+            ddg_endpoints = (
+                "https://html.duckduckgo.com/html/?q=",
+                "https://duckduckgo.com/html/?q=",
+                "https://lite.duckduckgo.com/lite/?q=",
+            )
+            q2 = f"{name} instagram {club_hint}".strip()
+            dheaders = dict(headers)
+            dheaders["Referer"] = "https://duckduckgo.com/"
+            for ep in ddg_endpoints:
+                _raise_if_cancelled_global()
+                durl = f"{ep}{quote_plus(q2)}"
+                dr = requests.get(durl, headers=dheaders, timeout=18)
+                if dr.status_code >= 400:
+                    continue
+                dplain = self._html_to_serp_plain(dr.text or "")
+                if not dplain:
+                    continue
+                if u:
+                    for needle in (
+                        f"@{u}",
+                        f"instagram.com/{u}",
+                        f"instagram.com/{u}/",
+                        f"({u})",
+                    ):
+                        idx = dplain.lower().find(needle.lower())
+                        if idx >= 0:
+                            window = dplain[max(0, idx - 900) : idx + 1400]
+                            fw, pw = self._parse_instagram_serp_stats(window)
+                            if fw is not None or pw is not None:
+                                return fw, pw
+                    # Même logique que plus haut : sans fenêtre contenant le handle,
+                    # on ne mélange pas les stats d'un autre compte.
+                else:
+                    fw, pw = self._parse_instagram_serp_stats(dplain)
+                    if fw is not None or pw is not None:
+                        return fw, pw
+        except Exception:
+            pass
+        return None, None
 
     def _ddgs_result_blob_and_links(self, r: dict) -> Tuple[str, List[str]]:
         """Titre puis corps (comme à l’écran) pour favoriser les extraits FR « Plus de … abonnés »."""
@@ -3917,7 +4146,13 @@ class AthleteApp(tk.Tk):
                     )
                 return
 
-    def _instagram_handle_from_ddgs(self, name: str, fast_first: bool) -> Optional[str]:
+    def _instagram_handle_from_ddgs(
+        self,
+        name: str,
+        fast_first: bool,
+        sport_hint: str = "",
+        club_hint: str = "",
+    ) -> Optional[str]:
         """
         Utilise le paquet ddgs (ex duckduckgo-search) pour des résultats structurés.
         Une simple requête HTTP sur duckduckgo.com/html renvoie souvent du HTML vide pour les scripts.
@@ -3928,10 +4163,17 @@ class AthleteApp(tk.Tk):
             append_log("[IG] Installez ddgs: pip install ddgs")
             return None
         # Sans guillemets autour du nom : les requêtes « "Prénom Nom" instagram » renvoient souvent 0 lien IG.
-        queries = [
-            f"{name} instagram",
-            f"instagram {name}",
-        ]
+        dis = " ".join(x for x in [(sport_hint or "").strip(), (club_hint or "").strip()] if x).strip()
+        queries = []
+        if dis:
+            queries.append(f"{name} {dis} instagram")
+            queries.append(f"instagram {name} {dis}")
+        queries.extend(
+            [
+                f"{name} instagram",
+                f"instagram {name}",
+            ]
+        )
 
         def links_from_rows(rows: List[dict]) -> List[str]:
             out: List[str] = []
@@ -3940,15 +4182,18 @@ class AthleteApp(tk.Tk):
                 out.extend(row_links)
             return out
 
+        append_log(f"[IG] {name}: DDGS start", step=True)
         merged: List[str] = []
         row_snapshots_all: List[Tuple[str, List[str]]] = []
         for q in queries:
             try:
-                time.sleep(0.35)
+                _raise_if_cancelled_global()
+                _sleep_interruptible(0.35)
                 ddgs = DDGS()
                 rows = list(ddgs.text(q, max_results=25))
                 if fast_first:
                     for r in rows:
+                        _raise_if_cancelled_global()
                         blob, single_links = self._ddgs_result_blob_and_links(r)
                         if not single_links:
                             continue
@@ -3961,10 +4206,12 @@ class AthleteApp(tk.Tk):
                                 f"followers={fol} posts={pst}"
                             )
                             append_log(f"[IG] {name}: DDGS — premier profil {picked}")
+                            append_log(f"[IG] {name}: DDGS done ({picked})", step=True)
                             return picked
                     append_log(f"[IG] {name}: DDGS {len(rows)} résultat(s), aucun profil pour «{q[:44]}…»")
                     continue
                 for r in rows:
+                    _raise_if_cancelled_global()
                     blob, row_links = self._ddgs_result_blob_and_links(r)
                     if row_links:
                         row_snapshots_all.append((blob, row_links))
@@ -3976,9 +4223,11 @@ class AthleteApp(tk.Tk):
                 continue
 
         if fast_first:
+            append_log(f"[IG] {name}: DDGS done (none)", step=True)
             return None
 
         if not merged:
+            append_log(f"[IG] {name}: DDGS done (0 liens)", step=True)
             return None
         seen = set()
         uniq: List[str] = []
@@ -3988,6 +4237,14 @@ class AthleteApp(tk.Tk):
                 continue
             seen.add(u)
             uniq.append(u)
+        # With club/sport disambiguation in query, keep first valid profile link.
+        if dis:
+            picked = self._first_valid_instagram_handle_from_links(uniq)
+            if picked:
+                self._ddgs_attach_serp_stats_for_handle(name, picked, row_snapshots_all)
+                append_log(f"[IG] {name}: DDGS premier lien (avec club/sport) {picked}")
+                append_log(f"[IG] {name}: DDGS done ({picked})", step=True)
+                return picked
         name_tokens = [t.lower() for t in re.findall(r"[A-Za-zÀ-ÿ]+", name or "") if len(t) >= 3]
         best = None
         best_score = -1.0
@@ -4009,12 +4266,15 @@ class AthleteApp(tk.Tk):
         if best_score > 0 and best:
             self._ddgs_attach_serp_stats_for_handle(name, best, row_snapshots_all)
             append_log(f"[IG] {name}: DDGS handle retenu (score) {best}")
+            append_log(f"[IG] {name}: DDGS done ({best})", step=True)
             return best
         picked = self._first_valid_instagram_handle_from_links(uniq)
         if picked:
             self._ddgs_attach_serp_stats_for_handle(name, picked, row_snapshots_all)
             append_log(f"[IG] {name}: DDGS fallback premier lien {picked}")
+            append_log(f"[IG] {name}: DDGS done ({picked})", step=True)
             return picked
+        append_log(f"[IG] {name}: DDGS done (none)", step=True)
         return None
 
     def _resolve_instagram_handle_http(
@@ -4031,8 +4291,15 @@ class AthleteApp(tk.Tk):
         instead of scoring by name tokens in the username (often absent e.g. motya_39).
         """
         self._pending_serp_ig_stats = None
-        via = self._instagram_handle_from_ddgs(name, fast_first=fast_first)
+        append_log(f"[IG] {name}: résolution handle (DDG) start", step=True)
+        via = self._instagram_handle_from_ddgs(
+            name,
+            fast_first=fast_first,
+            sport_hint=sport_hint,
+            club_hint=club_hint,
+        )
         if via:
+            append_log(f"[IG] {name}: résolution handle (DDG) done ({via})", step=True)
             return via
 
         headers = {
@@ -4065,6 +4332,7 @@ class AthleteApp(tk.Tk):
             last_status = None
             for q in queries:
                 for ep in endpoints:
+                    _raise_if_cancelled_global()
                     url = f"{ep}{quote_plus(q)}"
                     try:
                         resp = requests.get(url, headers=headers, timeout=18)
@@ -4086,6 +4354,7 @@ class AthleteApp(tk.Tk):
                                     f"[IG] {name}: DDG HTML stats SERP followers={fol} posts={pst}"
                                 )
                                 append_log(f"[IG] {name}: DDG premier lien retenu {picked}")
+                                append_log(f"[IG] {name}: résolution handle (DDG) done ({picked})", step=True)
                                 return picked
                             append_log(f"[IG] {name}: DDG liens non profils, autre tentative…")
                             continue
@@ -4098,12 +4367,14 @@ class AthleteApp(tk.Tk):
                     break
             if fast_first:
                 append_log(f"[IG] {name}: DDG aucun profil Instagram exploitable après tentatives")
+                append_log(f"[IG] {name}: résolution handle (DDG) done (none)", step=True)
                 return None
             if not links:
                 append_log(
                     f"[IG] {name}: DDG aucun lien instagram"
                     + (f" (dernier HTTP {last_status})" if last_status is not None else "")
                 )
+                append_log(f"[IG] {name}: résolution handle (DDG) done (0 liens)", step=True)
                 return None
 
             name_tokens = [t.lower() for t in re.findall(r"[A-Za-zÀ-ÿ]+", name or "") if len(t) >= 3]
@@ -4127,11 +4398,14 @@ class AthleteApp(tk.Tk):
                     best = handle
                     best_score = score
             if best_score > 0:
+                append_log(f"[IG] {name}: résolution handle (DDG) done ({best})", step=True)
                 return best
             append_log(f"[IG] {name}: DDG liens non pertinents")
+            append_log(f"[IG] {name}: résolution handle (DDG) done (none)", step=True)
             return None
         except Exception:
             append_log(f"[IG] {name}: DDG erreur")
+            append_log(f"[IG] {name}: résolution handle (DDG) done (error)", step=True)
             return None
 
     def _resolve_instagram_handle_google_http_first(self, name: str, club_hint: str = "") -> Optional[str]:
@@ -4528,21 +4802,9 @@ class AthleteApp(tk.Tk):
     def _format_age_human(self, age_value: str, birth_date: str) -> str:
         v = (age_value or "").strip()
         if birth_date:
-            for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
-                try:
-                    born = dt.datetime.strptime((birth_date or "").strip(), fmt).date()
-                    today = dt.date.today()
-                    years = today.year - born.year
-                    months = today.month - born.month
-                    if today.day < born.day:
-                        months -= 1
-                    if months < 0:
-                        years -= 1
-                        months += 12
-                    if years >= 0 and months >= 0:
-                        return f"{years} ans, {months} mois"
-                except ValueError:
-                    continue
+            s = calc_age_human(birth_date)
+            if s:
+                return s
         if v:
             m = re.search(r"\d+", v)
             if m:
@@ -4772,7 +5034,7 @@ class AthleteApp(tk.Tk):
         def save_manual() -> None:
             row = {c: entries[c].get().strip() for c in CSV_COLUMNS}
             if not row["Age"]:
-                row["Age"] = calc_age(row.get("Date de naissance", ""))
+                row["Age"] = calc_age_human(row.get("Date de naissance", "")) or calc_age(row.get("Date de naissance", ""))
             self.tree.insert("", "end", values=[row.get(c, "") for c in CSV_COLUMNS])
             self._persist_table_changes(status="Ligne ajoutée.")
             win.destroy()
@@ -4780,10 +5042,18 @@ class AthleteApp(tk.Tk):
         ttk.Button(frame, text="Ajouter", command=save_manual).grid(row=len(CSV_COLUMNS) + 1, column=1, sticky="e", pady=10)
 
     def _persist_table_changes(self, status: Optional[str] = None) -> None:
-        self._autosave_csv(self._current_search_text() or "manuel")
+        # Pendant une recherche, éviter l'auto-sauvegarde à chaque clic/édition (coûteux).
+        # On marque "dirty" et on persiste une seule fois en fin de recherche.
+        if getattr(self, "_search_in_progress", False):
+            self._autosave_dirty_during_search = True
+            self._build_final_results_from_table()
+            if status:
+                self._set_status(status, step=True)
+            return
+        self._autosave_csv(self._current_search_text() or "manuel", timing_step=True)
         self._build_final_results_from_table()
         if status:
-            self._set_status(status)
+            self._set_status(status, step=True)
 
     def _on_tree_select_all(self, _event: Optional[tk.Event] = None) -> str:
         """Ctrl+A / Cmd+A : sélectionner toutes les lignes du tableau (puis suppression avec Suppr ou −)."""
@@ -4902,12 +5172,6 @@ def acquire_single_instance() -> bool:
 
 def main() -> None:
     ensure_app_folders()
-    if not acquire_single_instance():
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showinfo(APP_TITLE, "L'application est déjà lancée.")
-        root.destroy()
-        return
     app = AthleteApp()
     app.mainloop()
 

@@ -5,6 +5,7 @@ pandas
 selenium
 webdriver-manager
 fake-useragent
+instagrapi
 tenacity
 rich
 loguru
