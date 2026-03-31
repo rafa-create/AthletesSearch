@@ -831,6 +831,21 @@ def _score_roster_candidate_url(
 
     if netloc.endswith(".fr"):
         score += 18
+    # Pénalise fortement les sites purement « médias / news » pour l'effectif.
+    media_hints = [
+        "rugbyrama.",
+        "madeinfoot.",
+        "madeinparisiens.",
+        "lequipe.",
+        "footmercato.",
+        "rmcsport.",
+        "eurosport.",
+        "sports.fr",
+        "francebleu.",
+        "lindependant.",
+    ]
+    if any(mh in netloc for mh in media_hints):
+        score -= 80
     # Préférer une page profonde (club / effectif) à une page d’accueil générique.
     path_trim = path.rstrip("/")
     depth = path_trim.count("/") if path_trim else 0
@@ -1138,7 +1153,12 @@ def serp_guess_birth_date(
 
 
 def _roster_discovery_queries(
-    club: str, ville: str, sport: str, *, prefer_feminine: bool
+    club: str,
+    ville: str,
+    sport: str,
+    *,
+    prefer_feminine: bool,
+    season_start_year: Optional[int] = None,
 ) -> List[str]:
     """
     Requêtes Google/DDGS pour trouver une page d’effectif (sport / club / ville saisis par l’utilisateur).
@@ -1148,16 +1168,27 @@ def _roster_discovery_queries(
     ville = (ville or "").strip()
     sp = (sport or "").strip()
     gender = "féminin" if prefer_feminine else "masculin"
+    season_part = ""
+    if season_start_year is not None:
+        try:
+            y = int(season_start_year)
+            season_part = f"{y}-{y+1}"
+        except Exception:
+            season_part = ""
 
     base = f"{club} {ville} {sp}".strip()
     if not base:
         return []
 
-    queries: List[str] = [
-        f"{base} effectif {gender} site officiel".strip(),
-        f"{base} effectif {gender}".strip(),
-        f"{club} {sp} effectif {gender}".strip(),
-    ]
+    queries: List[str] = []
+    # 1) Requête principale, la plus proche de ce que tu tapes manuellement.
+    if season_part:
+        queries.append(f"{base} effectif {season_part} {gender} site officiel".strip())
+    else:
+        queries.append(f"{base} effectif {gender} site officiel".strip())
+
+    # 2) Une seule requête de secours, plus large (sans saison / sans « site officiel »).
+    queries.append(f"{base} effectif {gender}".strip())
     # Nettoyage basique
     seen: set = set()
     out: List[str] = []
@@ -1170,7 +1201,12 @@ def _roster_discovery_queries(
 
 
 def discover_official_roster_url_google_http(
-    club: str, ville: str, *, prefer_feminine: bool = False, sport: str = ""
+    club: str,
+    ville: str,
+    *,
+    prefer_feminine: bool = False,
+    sport: str = "",
+    season_start_year: Optional[int] = None,
 ) -> Optional[str]:
     """
     Same idea as typing in Google: « nom du club effectif » (HTTP SERP, no Selenium).
@@ -1182,7 +1218,11 @@ def discover_official_roster_url_google_http(
         return None
     ville = (ville or "").strip()
     raw_queries = _roster_discovery_queries(
-        club, ville, sport, prefer_feminine=prefer_feminine
+        club,
+        ville,
+        sport,
+        prefer_feminine=prefer_feminine,
+        season_start_year=season_start_year,
     )
     seen_q: set = set()
     queries: List[str] = []
@@ -1232,7 +1272,12 @@ def discover_official_roster_url_google_http(
 
 
 def discover_official_roster_url_ddgs(
-    club: str, ville: str, *, prefer_feminine: bool = False, sport: str = ""
+    club: str,
+    ville: str,
+    *,
+    prefer_feminine: bool = False,
+    sport: str = "",
+    season_start_year: Optional[int] = None,
 ) -> Optional[str]:
     """Fallback: DuckDuckGo text search (similar intent to Google)."""
     try:
@@ -1240,7 +1285,11 @@ def discover_official_roster_url_ddgs(
     except Exception:
         return None
     raw_queries = _roster_discovery_queries(
-        club, ville, sport, prefer_feminine=prefer_feminine
+        club,
+        ville,
+        sport,
+        prefer_feminine=prefer_feminine,
+        season_start_year=season_start_year,
     )
     seen_q: set = set()
     queries: List[str] = []
@@ -2853,11 +2902,19 @@ class AthleteApp(tk.Tk):
                     step=True,
                 )
                 roster_url = discover_official_roster_url_google_http(
-                    club, ville, prefer_feminine=prefer_fem, sport=sport
+                    club,
+                    ville,
+                    prefer_feminine=prefer_fem,
+                    sport=sport,
+                    season_start_year=filters.saison_start_year,
                 )
                 if not roster_url:
                     roster_url = discover_official_roster_url_ddgs(
-                        club, ville, prefer_feminine=prefer_fem, sport=sport
+                        club,
+                        ville,
+                        prefer_feminine=prefer_fem,
+                        sport=sport,
+                        season_start_year=filters.saison_start_year,
                     )
                 if not roster_url:
                     roster_url = resolve_official_club_roster_url(club)
@@ -3336,8 +3393,9 @@ class AthleteApp(tk.Tk):
                 append_log(f"[IG] {name}: scraping ignoré (pas d'URL instagram)")
             elif self._ig_fast_mode_current:
                 append_log(f"[IG] {name}: mode rapide, scraping public désactivé (handle conservé)")
-                # Avec identifiants Instagram : complément léger (bio, posts 90j) via API auth,
-                # sans écraser abonnés/posts déjà issus du SERP.
+                # Avec identifiants Instagram : complément léger (bio, posts 90j) via API auth uniquement.
+                # En mode Rapide, le nombre d'abonnés/posts doit venir EXCLUSIVEMENT des extraits SERP
+                # (DDG/Google) pour rester cohérent avec le mode choisi.
                 if (
                     self._ig_scraper is not None
                     and getattr(self._ig_scraper, "has_auth_credentials", lambda: False)()
@@ -3351,10 +3409,6 @@ class AthleteApp(tk.Tk):
                             out["bio"] = ig_data["bio"]
                         if ig_data.get("posts_last_90d") is not None:
                             out["posts_last_90d"] = ig_data["posts_last_90d"]
-                        if out.get("followers") is None and ig_data.get("followers") is not None:
-                            out["followers"] = ig_data["followers"]
-                        if out.get("posts") is None and ig_data.get("posts") is not None:
-                            out["posts"] = ig_data["posts"]
                         append_log(
                             f"[IG] {name}: auth complété bio={'oui' if out.get('bio') else 'non'} "
                             f"posts_90j={out.get('posts_last_90d')}"
@@ -3397,12 +3451,10 @@ class AthleteApp(tk.Tk):
                         out["posts"] = ig_data["posts"]
                     if ig_data.get("followers") is not None:
                         out["followers"] = ig_data["followers"]
-                if (
-                    not self._ig_fast_mode_current
-                    and ig_url
-                    and (out.get("followers") is None or out.get("posts") is None)
-                ):
-                    gs, gp = self._serp_google_stats_for_handle(name, club_hint or "", out.get("instagram"))
+                if ig_url and (out.get("followers") is None or out.get("posts") is None):
+                    # 1) Essayer autour du handle courant (quand il est fiable).
+                    ig_for_stats = out.get("instagram")
+                    gs, gp = self._serp_google_stats_for_handle(name, club_hint or "", ig_for_stats)
                     if gs is not None and out.get("followers") is None:
                         out["followers"] = gs
                     if gp is not None and out.get("posts") is None:
@@ -3412,6 +3464,22 @@ class AthleteApp(tk.Tk):
                             f"[IG] {name}: Google SERP — complément followers/posts "
                             f"(posts_90j impossible sans dates dans l’extrait ni API profil)"
                         )
+                    # 2) Si rien trouvé et handle issu de Wikidata, refaire une passe
+                    # purement sur « nom + instagram » (sans se baser sur ce handle),
+                    # comme le ferait une recherche manuelle.
+                    if handle_source == "wikidata" and (
+                        out.get("followers") is None or out.get("posts") is None
+                    ):
+                        gs2, gp2 = self._serp_google_stats_for_handle(name, club_hint or "", None)
+                        if gs2 is not None and out.get("followers") is None:
+                            out["followers"] = gs2
+                        if gp2 is not None and out.get("posts") is None:
+                            out["posts"] = gp2
+                        if gs2 is not None or gp2 is not None:
+                            append_log(
+                                f"[IG] {name}: Google SERP (nom+instagram) — complément followers/posts "
+                                f"(fallback handle Wikidata)"
+                            )
                 if (
                     pending_serp
                     and not self._ig_fast_mode_current
@@ -4019,10 +4087,8 @@ class AthleteApp(tk.Tk):
     ) -> Tuple[Optional[int], Optional[int]]:
         """
         Requête Google « nom instagram » et parse abonnés/posts dans la page,
-        en priorité autour du handle connu (ex. handle manuel alors que scrape IG a échoué).
+        comme une recherche manuelle « nom + instagram ».
         """
-        hn = normalize_instagram_handle(ig or "") or ""
-        u = hn.lstrip("@").lower() if hn else ""
         q = f"{name} instagram {club_hint}".strip()
         url = f"https://www.google.com/search?hl=fr&num=15&q={quote_plus(q)}"
         headers = {
@@ -4037,31 +4103,12 @@ class AthleteApp(tk.Tk):
         try:
             resp = requests.get(url, headers=headers, timeout=18)
             if resp.status_code >= 400:
-                plain = ""
-            else:
-                plain = self._html_to_serp_plain(resp.text or "")
+                return None, None
+            plain = self._html_to_serp_plain(resp.text or "")
             if plain:
-                if u:
-                    # Si on connaît le handle, on ne fait confiance qu'aux stats
-                    # trouvées dans une fenêtre de texte où ce handle apparaît.
-                    for needle in (
-                        f"@{u}",
-                        f"instagram.com/{u}",
-                        f"instagram.com/{u}/",
-                        f"({u})",
-                    ):
-                        idx = plain.lower().find(needle.lower())
-                        if idx >= 0:
-                            window = plain[max(0, idx - 900) : idx + 1400]
-                            fw, pw = self._parse_instagram_serp_stats(window)
-                            if fw is not None or pw is not None:
-                                return fw, pw
-                    # Handle connu mais aucune fenêtre avec ce handle → on ne prend PAS
-                    # de stats « génériques » (risque de tomber sur le compte du club).
-                else:
-                    fw, pw = self._parse_instagram_serp_stats(plain)
-                    if fw is not None or pw is not None:
-                        return fw, pw
+                fw, pw = self._parse_instagram_serp_stats(plain)
+                if fw is not None or pw is not None:
+                    return fw, pw
         except Exception:
             pass
 
@@ -4084,25 +4131,9 @@ class AthleteApp(tk.Tk):
                 dplain = self._html_to_serp_plain(dr.text or "")
                 if not dplain:
                     continue
-                if u:
-                    for needle in (
-                        f"@{u}",
-                        f"instagram.com/{u}",
-                        f"instagram.com/{u}/",
-                        f"({u})",
-                    ):
-                        idx = dplain.lower().find(needle.lower())
-                        if idx >= 0:
-                            window = dplain[max(0, idx - 900) : idx + 1400]
-                            fw, pw = self._parse_instagram_serp_stats(window)
-                            if fw is not None or pw is not None:
-                                return fw, pw
-                    # Même logique que plus haut : sans fenêtre contenant le handle,
-                    # on ne mélange pas les stats d'un autre compte.
-                else:
-                    fw, pw = self._parse_instagram_serp_stats(dplain)
-                    if fw is not None or pw is not None:
-                        return fw, pw
+                fw, pw = self._parse_instagram_serp_stats(dplain)
+                if fw is not None or pw is not None:
+                    return fw, pw
         except Exception:
             pass
         return None, None
@@ -4239,6 +4270,8 @@ class AthleteApp(tk.Tk):
             uniq.append(u)
         # With club/sport disambiguation in query, keep first valid profile link.
         if dis:
+            # Premier lien IG trouvé pour les requêtes avec club/sport,
+            # comme une recherche manuelle « nom club instagram ».
             picked = self._first_valid_instagram_handle_from_links(uniq)
             if picked:
                 self._ddgs_attach_serp_stats_for_handle(name, picked, row_snapshots_all)
